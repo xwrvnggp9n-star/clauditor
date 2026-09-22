@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs'
 import { saveSessionState as saveSState, extractSessionStateFromTranscript, readRecentHandoffs, extractHandoffDescription } from '../features/session-state.js'
 import { readConfig } from '../config.js'
 import { loadCalibration } from '../features/calibration.js'
+import { contextSizeOf, exceedsContextPct } from '../features/context-limit.js'
 import { homedir } from 'node:os'
 import { resolve } from 'node:path'
 import { logActivity } from '../features/activity-log.js'
@@ -75,17 +76,19 @@ export async function handleUserPromptSubmitHook(): Promise<void> {
     }
 
     const analysis = analyzeSession(transcriptPath)
-    const cal = loadCalibration()
-    if (!analysis || analysis.turns < cal.minTurns) {
+    if (!analysis) {
       process.stdout.write('{}')
       return
     }
 
+    const cal = loadCalibration()
     const wasteFactor = analysis.baseline > 0
       ? Math.round(analysis.current / analysis.baseline)
       : 0
+    const context = exceedsContextPct(analysis.contextSize, analysis.model, config.rotation.contextBlockPct)
+    const wasteBlock = analysis.turns >= cal.minTurns && wasteFactor >= cal.wasteThreshold
 
-    if (wasteFactor < cal.wasteThreshold) {
+    if (!context.exceeded && !wasteBlock) {
       process.stdout.write('{}')
       return
     }
@@ -121,7 +124,9 @@ export async function handleUserPromptSubmitHook(): Promise<void> {
     logActivity({
       type: 'context_warning',
       session: sessionId.slice(0, 8),
-      message: `BLOCKED prompt — ${wasteFactor}x waste factor (${Math.round(analysis.current / 1000)}k/turn vs ${Math.round(analysis.baseline / 1000)}k baseline)`,
+      message: context.exceeded
+        ? `BLOCKED prompt — context ${context.pct}% full (${Math.round(analysis.contextSize / 1000)}k tokens, limit ${config.rotation.contextBlockPct}%)`
+        : `BLOCKED prompt — ${wasteFactor}x waste factor (${Math.round(analysis.current / 1000)}k/turn vs ${Math.round(analysis.baseline / 1000)}k baseline)`,
     }).catch(() => {})
 
     // Output block decision
@@ -133,11 +138,16 @@ export async function handleUserPromptSubmitHook(): Promise<void> {
       decision: 'block',
       reason:
         `\n╔══════════════════════════════════════════════════════════════╗\n` +
-        `║  clauditor: Session using ${wasteFactor}x more quota than necessary  ║\n` +
-        `╚══════════════════════════════════════════════════════════════╝\n\n` +
-        `Your turns started at ${Math.round(analysis.baseline / 1000)}k tokens.\n` +
-        `They're now at ${Math.round(analysis.current / 1000)}k tokens.\n` +
-        `Each turn uses ${wasteFactor}x more quota than when this session started.\n\n` +
+        (context.exceeded
+          ? `║  clauditor: Context window is ${context.pct}% full                        ║\n` +
+            `╚══════════════════════════════════════════════════════════════╝\n\n` +
+            `This session is at ${Math.round(analysis.contextSize / 1000)}k tokens, past your ${config.rotation.contextBlockPct}% rotation limit.\n` +
+            `Every turn re-sends all of it.\n\n`
+          : `║  clauditor: Session using ${wasteFactor}x more quota than necessary  ║\n` +
+            `╚══════════════════════════════════════════════════════════════╝\n\n` +
+            `Your turns started at ${Math.round(analysis.baseline / 1000)}k tokens.\n` +
+            `They're now at ${Math.round(analysis.current / 1000)}k tokens.\n` +
+            `Each turn uses ${wasteFactor}x more quota than when this session started.\n\n`) +
         `Session state saved.\n` +
         `  Branch: ${analysis.branch || 'unknown'}\n` +
         `  Files: ${filesList}\n` +
@@ -154,6 +164,8 @@ interface SessionAnalysis {
   turns: number
   baseline: number      // avg tokens/turn for first 5 turns
   current: number       // avg tokens/turn for last 5 turns
+  contextSize: number   // context tokens on the last turn
+  model: string | null
   cwd: string | null
   branch: string | null
   filesModified: string[]
@@ -165,6 +177,8 @@ function analyzeSession(transcriptPath: string): SessionAnalysis | null {
     const lines = content.split('\n')
 
     const turnTokens: number[] = []
+    let contextSize = 0
+    let model: string | null = null
     const filesModified = new Set<string>()
     let cwd: string | null = null
     let branch: string | null = null
@@ -187,6 +201,8 @@ function analyzeSession(transcriptPath: string): SessionAnalysis | null {
           const total = (u.input_tokens || 0) + (u.output_tokens || 0) +
             (u.cache_creation_input_tokens || 0) + (u.cache_read_input_tokens || 0)
           turnTokens.push(total)
+          contextSize = contextSizeOf(u)
+          model = r.message.model || model
         }
         if (r.type === 'assistant' && r.message?.content) {
           for (const block of r.message.content) {
@@ -208,6 +224,8 @@ function analyzeSession(transcriptPath: string): SessionAnalysis | null {
       turns: turnTokens.length,
       baseline,
       current,
+      contextSize,
+      model,
       cwd,
       branch,
       filesModified: Array.from(filesModified),

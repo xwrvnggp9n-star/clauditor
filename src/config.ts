@@ -20,6 +20,8 @@ export interface ClauditorUserConfig {
     enabled: boolean
     threshold: number
     minTurns: number
+    /** Also rotate once context reaches this % of the model's window (0 = off) */
+    contextBlockPct: number
   }
   notifications: {
     desktop: boolean
@@ -33,6 +35,7 @@ const DEFAULTS: ClauditorUserConfig = {
     enabled: true,
     threshold: 100_000,
     minTurns: 30,
+    contextBlockPct: 0,
   },
   notifications: {
     desktop: true,

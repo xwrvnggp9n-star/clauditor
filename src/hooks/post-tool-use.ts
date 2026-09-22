@@ -14,6 +14,7 @@ import { estimateQuotaBurnRate } from '../features/quota-burn.js'
 import { logActivity } from '../features/activity-log.js'
 import { saveSessionState, extractSessionStateFromTranscript, findTranscriptPathSync as findTranscriptSync } from '../features/session-state.js'
 import { readConfig } from '../config.js'
+import { contextLimitForModel, contextSizeOf, exceedsContextPct } from '../features/context-limit.js'
 import { loadCalibration } from '../features/calibration.js'
 import { readStdin, outputDecision, writeJsonFileAtomic, readJsonFile } from './shared.js'
 
@@ -402,15 +403,10 @@ async function checkSessionHealth(sessionId: string): Promise<HookDecision | nul
 
     // Check context window size — detect model from transcript
     const lastTurn = turns[turns.length - 1]
-    const contextSize =
-      lastTurn.usage.input_tokens +
-      lastTurn.usage.cache_creation_input_tokens +
-      lastTurn.usage.cache_read_input_tokens
+    const contextSize = contextSizeOf(lastTurn.usage)
     // Detect model from the JSONL to get correct context limit
     const model = extractModel(records)
-    const isOpus = model?.includes('opus') ?? false
-    const contextLimit = isOpus ? 1_000_000 : 200_000
-    const pct = Math.round((contextSize / contextLimit) * 100)
+    const pct = Math.round((contextSize / contextLimitForModel(model)) * 100)
 
     if (pct >= 95) {
       warnings.push(
@@ -510,7 +506,7 @@ async function checkSessionHealth(sessionId: string): Promise<HookDecision | nul
     // SESSION ROTATION — check waste factor.
     // If waste is 10x+, BLOCK the tool result. Claude must stop.
     // This works during autonomous operation when UserPromptSubmit doesn't fire.
-    const rotationBlock = checkSessionRotationBlock(sessionId, turns)
+    const rotationBlock = checkSessionRotationBlock(sessionId, turns, model)
     if (rotationBlock) {
       return rotationBlock
     }
@@ -624,9 +620,12 @@ function checkSkillNudge(sessionId: string, toolName: string): string | null {
  * Uses decision: "block" to stop Claude after a tool call.
  * Same waste factor logic, but blocks the tool result.
  */
-function checkSessionRotationBlock(sessionId: string, turns: TurnMetrics[]): HookDecision | null {
+function checkSessionRotationBlock(sessionId: string, turns: TurnMetrics[], model: string | null): HookDecision | null {
   const config = readConfig()
   if (!config.rotation.enabled) return null
+
+  const contextBlock = checkContextPctBlock(sessionId, turns, model, config.rotation.contextBlockPct)
+  if (contextBlock) return contextBlock
 
   // Use calibrated threshold (auto-computed from user's own session history)
   // Falls back to conservative 10x / 30 turns if not enough data
@@ -686,6 +685,62 @@ function checkSessionRotationBlock(sessionId: string, turns: TurnMetrics[]): Hoo
       `IMPORTANT — Before stopping, do these two things:\n` +
       `1. Tell the user: this session is burning ${wasteFactor}x more quota than necessary. ` +
       `Their progress is saved. Run \`claude\` to start fresh at ~${Math.round(baseline / 1000)}k tokens/turn instead of ${Math.round(current / 1000)}k.\n` +
+      HANDOFF_INSTRUCTIONS,
+  }
+}
+
+/**
+ * Context-size rotation: block once the last turn's context passes
+ * `blockPct`% of the model's window, independent of the waste factor.
+ * Heavy session starts (big tool/skill lists) inflate the waste baseline,
+ * which can push the waste-factor block past 40% of a 1M window.
+ * Re-blocks every +10 points, or after compaction drops context by half.
+ */
+function checkContextPctBlock(
+  sessionId: string,
+  turns: TurnMetrics[],
+  model: string | null,
+  blockPct: number,
+): HookDecision | null {
+  if (turns.length < 5) return null
+  const contextSize = contextSizeOf(turns[turns.length - 1].usage)
+  const { exceeded, pct } = exceedsContextPct(contextSize, model, blockPct)
+  if (!exceeded) return null
+
+  const blockedAt = readJsonFile<Record<string, number>>(BLOCK_NUDGE_FILE, {})
+  const key = `ctx-${sessionId}`
+  const lastPct = blockedAt[key] || 0
+  if (lastPct > 0 && pct >= lastPct / 2 && pct < lastPct + 10) return null
+
+  blockedAt[key] = pct
+  try { writeJsonFileAtomic(BLOCK_NUDGE_FILE, blockedAt) } catch {}
+
+  const transcriptPath = findTranscriptSync(sessionId)
+  if (transcriptPath) {
+    const stateData = extractSessionStateFromTranscript(sessionId, transcriptPath)
+    if (stateData) saveSessionState(stateData)
+  }
+
+  const k = Math.round(contextSize / 1000)
+  logActivity({
+    type: 'context_warning',
+    session: sessionId.slice(0, 8),
+    message: `BLOCKED tool result — context ${pct}% full (${k}k tokens, limit ${blockPct}%)`,
+  }).catch(() => {})
+
+  return {
+    decision: 'block',
+    reason:
+      `clauditor: Context window is ${pct}% full (${k}k tokens), past the ${blockPct}% rotation limit. ` +
+      `Session progress has been saved to ~/.clauditor/last-session.md.\n` +
+      `IMPORTANT — Before stopping, do these two things:\n` +
+      `1. Tell the user: context is ${pct}% full and every turn now re-sends ${k}k tokens. ` +
+      `Their progress is saved. Run \`claude\` to start fresh.\n` +
+      HANDOFF_INSTRUCTIONS,
+  }
+}
+
+const HANDOFF_INSTRUCTIONS =
       `2. Write your handoff using EXACTLY this format (clauditor parses these sections to preserve context for the next session):\n\n` +
       `TASK: (one line — what you were working on)\n\n` +
       `COMPLETED:\n- (what's done, one bullet per item)\n\n` +
@@ -698,9 +753,7 @@ function checkSessionRotationBlock(sessionId: string, turns: TurnMetrics[]): Hoo
       `WHAT_SURPRISED_ME:\n- (unexpected behavior, undocumented quirks)\n\n` +
       `GOTCHAS:\n- (file: path/to/file — specific warning about this file)\n\n` +
       `3. In the new session, tell the user to just say "continue where I left off" — clauditor will inject the saved context automatically.\n` +
-      `4. Include the marker [clauditor-rotation] at the end of your response so clauditor can capture your summary.`,
-  }
-}
+      `4. Include the marker [clauditor-rotation] at the end of your response so clauditor can capture your summary.`
 
 const BLOCK_NUDGE_FILE = resolve(homedir(), '.clauditor', 'prompt-block-nudge.json')
 

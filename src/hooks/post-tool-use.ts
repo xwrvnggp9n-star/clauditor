@@ -16,6 +16,7 @@ import { saveSessionState, extractSessionStateFromTranscript, findTranscriptPath
 import { readConfig } from '../config.js'
 import { contextLimitForModel, contextSizeOf, exceedsContextPct } from '../features/context-limit.js'
 import { loadCalibration } from '../features/calibration.js'
+import { requestRotation } from '../features/auto-rotate.js'
 import { readStdin, outputDecision, writeJsonFileAtomic, readJsonFile } from './shared.js'
 
 /**
@@ -665,10 +666,9 @@ function checkSessionRotationBlock(sessionId: string, turns: TurnMetrics[], mode
 
   // Save session state — each save creates a separate file now (no overwrite risk)
   const transcriptPath = findTranscriptSync(sessionId)
-  if (transcriptPath) {
-    const stateData = extractSessionStateFromTranscript(sessionId, transcriptPath)
-    if (stateData) saveSessionState(stateData)
-  }
+  const stateData = transcriptPath ? extractSessionStateFromTranscript(sessionId, transcriptPath) : null
+  if (stateData) saveSessionState(stateData)
+  const autoRestart = requestRotation({ state: 'pending', sessionId, cwd: stateData?.cwd ?? null, prompt: null })
 
   logActivity({
     type: 'context_warning',
@@ -684,8 +684,10 @@ function checkSessionRotationBlock(sessionId: string, turns: TurnMetrics[], mode
       `Session progress has been saved to ~/.clauditor/last-session.md.\n` +
       `IMPORTANT — Before stopping, do these two things:\n` +
       `1. Tell the user: this session is burning ${wasteFactor}x more quota than necessary. ` +
-      `Their progress is saved. Run \`claude\` to start fresh at ~${Math.round(baseline / 1000)}k tokens/turn instead of ${Math.round(current / 1000)}k.\n` +
-      HANDOFF_INSTRUCTIONS,
+      (autoRestart
+        ? `Their progress is saved and a fresh session will start automatically when you stop.\n`
+        : `Their progress is saved. Run \`claude\` to start fresh at ~${Math.round(baseline / 1000)}k tokens/turn instead of ${Math.round(current / 1000)}k.\n`) +
+      handoffInstructions(autoRestart),
   }
 }
 
@@ -716,10 +718,9 @@ function checkContextPctBlock(
   try { writeJsonFileAtomic(BLOCK_NUDGE_FILE, blockedAt) } catch {}
 
   const transcriptPath = findTranscriptSync(sessionId)
-  if (transcriptPath) {
-    const stateData = extractSessionStateFromTranscript(sessionId, transcriptPath)
-    if (stateData) saveSessionState(stateData)
-  }
+  const stateData = transcriptPath ? extractSessionStateFromTranscript(sessionId, transcriptPath) : null
+  if (stateData) saveSessionState(stateData)
+  const autoRestart = requestRotation({ state: 'pending', sessionId, cwd: stateData?.cwd ?? null, prompt: null })
 
   const k = Math.round(contextSize / 1000)
   logActivity({
@@ -735,12 +736,22 @@ function checkContextPctBlock(
       `Session progress has been saved to ~/.clauditor/last-session.md.\n` +
       `IMPORTANT — Before stopping, do these two things:\n` +
       `1. Tell the user: context is ${pct}% full and every turn now re-sends ${k}k tokens. ` +
-      `Their progress is saved. Run \`claude\` to start fresh.\n` +
-      HANDOFF_INSTRUCTIONS,
+      (autoRestart
+        ? `Their progress is saved and a fresh session will start automatically when you stop.\n`
+        : `Their progress is saved. Run \`claude\` to start fresh.\n`) +
+      handoffInstructions(autoRestart),
   }
 }
 
-const HANDOFF_INSTRUCTIONS =
+function handoffInstructions(autoRestart: boolean): string {
+  return HANDOFF_FORMAT +
+    (autoRestart
+      ? `3. Do not start any new work after the handoff — end your turn so the restart can happen.\n`
+      : `3. In the new session, tell the user to just say "continue where I left off" — clauditor will inject the saved context automatically.\n`) +
+    `4. Include the marker [clauditor-rotation] at the end of your response so clauditor can capture your summary.`
+}
+
+const HANDOFF_FORMAT =
       `2. Write your handoff using EXACTLY this format (clauditor parses these sections to preserve context for the next session):\n\n` +
       `TASK: (one line — what you were working on)\n\n` +
       `COMPLETED:\n- (what's done, one bullet per item)\n\n` +
@@ -751,9 +762,7 @@ const HANDOFF_INSTRUCTIONS =
       `USER_PREFERENCES:\n- (anything the user explicitly asked for or rejected)\n\n` +
       `BLOCKERS:\n- (unresolved issues, things that need user input)\n\n` +
       `WHAT_SURPRISED_ME:\n- (unexpected behavior, undocumented quirks)\n\n` +
-      `GOTCHAS:\n- (file: path/to/file — specific warning about this file)\n\n` +
-      `3. In the new session, tell the user to just say "continue where I left off" — clauditor will inject the saved context automatically.\n` +
-      `4. Include the marker [clauditor-rotation] at the end of your response so clauditor can capture your summary.`
+      `GOTCHAS:\n- (file: path/to/file — specific warning about this file)\n\n`
 
 const BLOCK_NUDGE_FILE = resolve(homedir(), '.clauditor', 'prompt-block-nudge.json')
 

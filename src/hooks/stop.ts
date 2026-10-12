@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto'
 import { logActivity } from '../features/activity-log.js'
 import { savePostCompactSummary } from '../features/session-state.js'
 import { readStdin, outputDecision } from './shared.js'
+import { markRotationReady } from '../features/auto-rotate.js'
 
 /**
  * Stop hook handler — detects compaction loops and blocks further execution.
@@ -40,6 +41,8 @@ export async function handleStopHook(): Promise<void> {
   ])
 
   const decision = analyzeForLoop(hookInput)
+  // The turn is really over (not blocked again) — let `clauditor run` restart
+  if (decision.decision !== 'block') markRotationReady(hookInput.session_id)
   outputDecision(decision)
 }
 

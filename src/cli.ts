@@ -158,15 +158,12 @@ program
 
 program
   .command('run')
-  .description('Run claude with auto-restart on session rotation')
-  .option('--max-restarts <n>', 'Max consecutive restarts before giving up', '10')
-  .option('--task <prompt>', 'Initial task prompt for the first session')
-  .action(async (opts: { maxRestarts: string; task?: string }) => {
-    const { runWithAutoRotation } = await import('./commands/run.js')
-    await runWithAutoRotation({
-      maxRestarts: parseInt(opts.maxRestarts, 10) || 10,
-      task: opts.task,
-    })
+  .description('Run claude; on session rotation, resume in a fresh claude automatically')
+  .usage('[--max-restarts <n>] [claude flags for every launch] [-- first-launch-only args]')
+  .allowUnknownOption()
+  .allowExcessArguments()
+  .action(() => {
+    // Parsed from raw argv (see bottom of file) so claude's flags pass through untouched
   })
 
 // ─── clauditor install ────────────────────────────────────────────
@@ -1793,4 +1790,11 @@ if (process.argv.length <= 2) {
   process.argv.push('report')
 }
 
-program.parse()
+const runIdx = process.argv.indexOf('run')
+const runHead = process.argv.slice(3, process.argv.indexOf('--') === -1 ? undefined : process.argv.indexOf('--'))
+if (runIdx === 2 && !runHead.some((a) => a === '-h' || a === '--help')) {
+  const { runWithAutoRotation, parseRunArgs } = await import('./commands/run.js')
+  await runWithAutoRotation(parseRunArgs(process.argv.slice(3)))
+} else {
+  program.parse()
+}

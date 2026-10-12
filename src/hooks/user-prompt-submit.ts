@@ -6,6 +6,7 @@ import { contextSizeOf, exceedsContextPct } from '../features/context-limit.js'
 import { homedir } from 'node:os'
 import { resolve } from 'node:path'
 import { logActivity } from '../features/activity-log.js'
+import { requestRotation } from '../features/auto-rotate.js'
 import { readStdin, readJsonFile, writeJsonFileAtomic, findTranscriptPathSync } from './shared.js'
 
 /**
@@ -129,6 +130,14 @@ export async function handleUserPromptSubmitHook(): Promise<void> {
         : `BLOCKED prompt — ${wasteFactor}x waste factor (${Math.round(analysis.current / 1000)}k/turn vs ${Math.round(analysis.baseline / 1000)}k baseline)`,
     }).catch(() => {})
 
+    // Under `clauditor run`: the wrapper ends this claude and resumes in a fresh one
+    const autoRestart = requestRotation({
+      state: 'ready',
+      sessionId,
+      cwd: hookInput.cwd || analysis.cwd,
+      prompt: hookInput.prompt || null,
+    })
+
     // Output block decision
     const filesList = analysis.filesModified.length > 0
       ? analysis.filesModified.slice(0, 10).join(', ')
@@ -152,8 +161,10 @@ export async function handleUserPromptSubmitHook(): Promise<void> {
         `  Branch: ${analysis.branch || 'unknown'}\n` +
         `  Files: ${filesList}\n` +
         `  Turns: ${analysis.turns}\n\n` +
-        `Start fresh: run \`claude\` — clauditor will inject your previous session context.\n` +
-        `Or press Enter to continue in this session (not recommended).`,
+        (autoRestart
+          ? `Restarting in a fresh session — your message will be sent there.`
+          : `Start fresh: run \`claude\` — clauditor will inject your previous session context.\n` +
+            `Or press Enter to continue in this session (not recommended).`),
     }))
   } catch {
     process.stdout.write('{}')

@@ -1,5 +1,8 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { EventEmitter } from 'node:events'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 // Mock child_process.spawn
 const mockSpawn = vi.fn()
@@ -13,102 +16,144 @@ vi.mock('../features/activity-log.js', () => ({
   logActivity: () => Promise.resolve(),
 }))
 
-import { runLoop } from './run.js'
+import { runLoop, parseRunArgs, continuePrompt } from './run.js'
+import type { RunOptions } from './run.js'
 
-function createChild(exitCode: number | null, signal: string | null) {
-  const child = new EventEmitter()
-  setTimeout(() => child.emit('exit', exitCode, signal), 0)
+type FakeChild = EventEmitter & { kill: (sig: string) => void; killedWith: string[] }
+
+/** A claude that runs until killed, or exits by itself after `exitAfterMs`. */
+function fakeClaude(opts: { exitCode?: number | null; signal?: string | null; exitAfterMs?: number; onStart?: () => void } = {}): FakeChild {
+  const child = new EventEmitter() as FakeChild
+  child.killedWith = []
+  child.kill = (sig: string) => {
+    child.killedWith.push(sig)
+    setTimeout(() => child.emit('exit', null, sig), 0)
+  }
+  setTimeout(() => opts.onStart?.(), 0)
+  if (opts.exitAfterMs !== undefined) {
+    setTimeout(() => child.emit('exit', opts.exitCode ?? 0, opts.signal ?? null), opts.exitAfterMs)
+  }
   return child
+}
+
+let dir: string
+let marker: string
+
+function base(extra: Partial<RunOptions> = {}): RunOptions {
+  return {
+    maxRestarts: 3,
+    persistentArgs: ['--dangerously-skip-permissions', '--chrome'],
+    firstArgs: ['-w', 'fix the bug'],
+    markerPath: marker,
+    pollMs: 5,
+    settleMs: 5,
+    ...extra,
+  }
+}
+
+function writeReady(m: Record<string, unknown> = {}) {
+  writeFileSync(marker, JSON.stringify({ state: 'ready', sessionId: 'abcdef1234', cwd: dir, prompt: null, at: 'x', ...m }))
+}
+
+// Date.now advances 10s per call, so no run looks like a crash loop
+function slowClock() {
+  let now = 0
+  vi.spyOn(Date, 'now').mockImplementation(() => (now += 10000))
 }
 
 describe('runLoop', () => {
   beforeEach(() => {
     mockSpawn.mockReset()
     vi.restoreAllMocks()
+    dir = mkdtempSync(join(tmpdir(), 'clauditor-run-'))
+    marker = join(dir, 'rotate.json')
   })
+  afterEach(() => rmSync(dir, { recursive: true, force: true }))
 
   it('exits cleanly when claude exits with code 0', async () => {
-    mockSpawn.mockReturnValue(createChild(0, null))
-    const result = await runLoop({ maxRestarts: 3 })
+    mockSpawn.mockReturnValue(fakeClaude({ exitAfterMs: 0 }))
+    const result = await runLoop(base())
 
     expect(result).toEqual({ exitCode: 0, restarts: 0, reason: 'normal_exit' })
     expect(mockSpawn).toHaveBeenCalledTimes(1)
   })
 
-  it('stops on SIGINT (user Ctrl+C)', async () => {
-    mockSpawn.mockReturnValue(createChild(null, 'SIGINT'))
-    const result = await runLoop({ maxRestarts: 3 })
+  it('first launch gets persistent + first-only args and the marker env', async () => {
+    mockSpawn.mockReturnValue(fakeClaude({ exitAfterMs: 0 }))
+    await runLoop(base())
+
+    const [cmd, args, spawnOpts] = mockSpawn.mock.calls[0]
+    expect(cmd).toBe('claude')
+    expect(args).toEqual(['--dangerously-skip-permissions', '--chrome', '-w', 'fix the bug'])
+    expect(spawnOpts.env.CLAUDITOR_ROTATE_FILE).toBe(marker)
+  })
+
+  it('stops when claude is killed by a signal it did not get from us', async () => {
+    mockSpawn.mockReturnValue(fakeClaude({ exitCode: null, signal: 'SIGTERM', exitAfterMs: 0 }))
+    const result = await runLoop(base())
 
     expect(result).toEqual({ exitCode: 0, restarts: 0, reason: 'signal' })
   })
 
-  it('stops on SIGTERM', async () => {
-    mockSpawn.mockReturnValue(createChild(null, 'SIGTERM'))
-    const result = await runLoop({ maxRestarts: 3 })
+  it('forwards a nonzero exit code — exit code 2 alone no longer restarts', async () => {
+    mockSpawn.mockReturnValue(fakeClaude({ exitCode: 2, exitAfterMs: 0 }))
+    const result = await runLoop(base())
 
-    expect(result).toEqual({ exitCode: 0, restarts: 0, reason: 'signal' })
+    expect(result).toEqual({ exitCode: 2, restarts: 0, reason: 'normal_exit' })
+    expect(mockSpawn).toHaveBeenCalledTimes(1)
   })
 
-  it('restarts on exit code 2 (rotation block)', async () => {
-    let now = 0
-    vi.spyOn(Date, 'now').mockImplementation(() => {
-      now += 10000
-      return now
-    })
+  it('on a ready marker: ends claude and resumes in the marker cwd, replaying the refused prompt', async () => {
+    slowClock()
+    let first!: FakeChild
+    mockSpawn
+      .mockImplementationOnce(() => (first = fakeClaude({ onStart: () => writeReady({ prompt: 'now add tests' }) })))
+      .mockImplementationOnce(() => fakeClaude({ exitAfterMs: 0 }))
 
-    let callCount = 0
-    mockSpawn.mockImplementation(() => {
-      callCount++
-      return createChild(callCount === 1 ? 2 : 0, null)
-    })
+    const result = await runLoop(base())
 
-    const result = await runLoop({ maxRestarts: 3 })
-
+    expect(first.killedWith).toEqual(['SIGTERM'])
     expect(result).toEqual({ exitCode: 0, restarts: 1, reason: 'normal_exit' })
-    expect(mockSpawn).toHaveBeenCalledTimes(2)
+    const [, args, spawnOpts] = mockSpawn.mock.calls[1]
+    // -w and the original prompt are NOT repeated; the worktree is reopened via cwd
+    expect(args).toEqual(['--dangerously-skip-permissions', '--chrome', '/clauditor continue now add tests'])
+    expect(spawnOpts.cwd).toBe(dir)
   })
 
-  it('passes --task as -p flag only on first spawn', async () => {
-    let now = 0
-    vi.spyOn(Date, 'now').mockImplementation(() => {
-      now += 10000
-      return now
-    })
+  it('does not act on a pending marker (Claude still writing its handoff)', async () => {
+    mockSpawn.mockReturnValue(fakeClaude({
+      exitAfterMs: 60,
+      onStart: () => writeFileSync(marker, JSON.stringify({ state: 'pending', sessionId: 's', cwd: null, prompt: null, at: 'x' })),
+    }))
+    const result = await runLoop(base())
 
-    let callCount = 0
-    mockSpawn.mockImplementation(() => {
-      callCount++
-      return createChild(callCount === 1 ? 2 : 0, null)
-    })
-
-    await runLoop({ maxRestarts: 3, task: 'fix the bug' })
-
-    expect(mockSpawn.mock.calls[0][1]).toEqual(['-p', 'fix the bug'])
-    expect(mockSpawn.mock.calls[1][1]).toEqual([])
+    expect(result.reason).toBe('normal_exit')
+    expect(mockSpawn).toHaveBeenCalledTimes(1)
   })
 
-  it('stops after max restarts reached', async () => {
-    let now = 0
-    vi.spyOn(Date, 'now').mockImplementation(() => {
-      now += 10000
-      return now
-    })
+  it('clears a stale marker before launching', async () => {
+    writeReady()
+    mockSpawn.mockReturnValue(fakeClaude({ exitAfterMs: 40 }))
+    const result = await runLoop(base())
 
-    mockSpawn.mockImplementation(() => createChild(2, null))
+    expect(result).toEqual({ exitCode: 0, restarts: 0, reason: 'normal_exit' })
+  })
 
-    const result = await runLoop({ maxRestarts: 2 })
+  it('stops after max restarts', async () => {
+    slowClock()
+    mockSpawn.mockImplementation(() => fakeClaude({ onStart: () => writeReady() }))
 
-    expect(result.reason).toBe('max_restarts')
-    expect(result.restarts).toBe(3) // counter increments past limit before loop exits
+    const result = await runLoop(base({ maxRestarts: 2 }))
+
+    expect(result).toEqual({ exitCode: 0, restarts: 2, reason: 'max_restarts' })
     expect(mockSpawn).toHaveBeenCalledTimes(3) // 1 initial + 2 restarts
   })
 
-  it('detects crash loop (exit <5s) and stops', async () => {
+  it('treats a rotation within seconds of launch as a loop and stops', async () => {
     vi.spyOn(Date, 'now').mockReturnValue(1000)
+    mockSpawn.mockImplementation(() => fakeClaude({ onStart: () => writeReady() }))
 
-    mockSpawn.mockImplementation(() => createChild(2, null))
-
-    const result = await runLoop({ maxRestarts: 3 })
+    const result = await runLoop(base())
 
     expect(result).toEqual({ exitCode: 1, restarts: 0, reason: 'crash_loop' })
     expect(mockSpawn).toHaveBeenCalledTimes(1)
@@ -119,16 +164,35 @@ describe('runLoop', () => {
     mockSpawn.mockReturnValue(child)
     setTimeout(() => child.emit('error', new Error('ENOENT')), 0)
 
-    const result = await runLoop({ maxRestarts: 3 })
+    const result = await runLoop(base())
 
     expect(result).toEqual({ exitCode: 1, restarts: 0, reason: 'spawn_error' })
   })
+})
 
-  it('forwards non-2 exit code from claude', async () => {
-    mockSpawn.mockReturnValue(createChild(130, null))
+describe('parseRunArgs', () => {
+  it('splits persistent flags from first-launch args at --', () => {
+    expect(parseRunArgs(['--dangerously-skip-permissions', '--chrome', '--', '-w', 'do X'])).toEqual({
+      maxRestarts: 10,
+      persistentArgs: ['--dangerously-skip-permissions', '--chrome'],
+      firstArgs: ['-w', 'do X'],
+    })
+  })
 
-    const result = await runLoop({ maxRestarts: 3 })
+  it('takes --max-restarts for itself, in either form', () => {
+    expect(parseRunArgs(['--max-restarts', '4', '--chrome']).maxRestarts).toBe(4)
+    expect(parseRunArgs(['--max-restarts=6']).maxRestarts).toBe(6)
+    expect(parseRunArgs(['--max-restarts', '4', '--chrome']).persistentArgs).toEqual(['--chrome'])
+  })
 
-    expect(result).toEqual({ exitCode: 130, restarts: 0, reason: 'normal_exit' })
+  it('leaves --max-restarts after -- alone', () => {
+    expect(parseRunArgs(['--', '--max-restarts', '4']).firstArgs).toEqual(['--max-restarts', '4'])
+  })
+})
+
+describe('continuePrompt', () => {
+  it('appends the refused prompt when there is one', () => {
+    expect(continuePrompt(null)).toBe('/clauditor continue')
+    expect(continuePrompt('ship it')).toBe('/clauditor continue ship it')
   })
 })

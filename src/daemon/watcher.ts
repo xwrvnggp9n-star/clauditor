@@ -81,6 +81,41 @@ export class SessionWatcher {
     }
   }
 
+  /**
+   * Parse only the newest transcripts (by mtime) younger than maxAgeMs.
+   * Session start uses this so it doesn't read the whole history.
+   */
+  async scanRecent(limit: number, maxAgeMs: number): Promise<void> {
+    const dir = this.projectPath
+      ? resolve(this.projectsDir, encodeProjectPath(this.projectPath))
+      : this.projectsDir
+    const cutoff = Date.now() - maxAgeMs
+    const found: { path: string; mtime: number }[] = []
+
+    const walk = async (d: string): Promise<void> => {
+      try {
+        const entries = await readdir(d, { withFileTypes: true })
+        for (const entry of entries) {
+          const fullPath = resolve(d, entry.name)
+          if (entry.isDirectory()) {
+            await walk(fullPath)
+          } else if (entry.name.endsWith('.jsonl')) {
+            try {
+              const s = await stat(fullPath)
+              if (s.mtimeMs >= cutoff) found.push({ path: fullPath, mtime: s.mtimeMs })
+            } catch {}
+          }
+        }
+      } catch {
+        // Ignore errors from missing directories
+      }
+    }
+
+    await walk(dir)
+    found.sort((a, b) => b.mtime - a.mtime)
+    for (const f of found.slice(0, limit)) await this.processFile(f.path)
+  }
+
   private async scanDirectory(dir: string): Promise<void> {
     try {
       const entries = await readdir(dir, { withFileTypes: true })

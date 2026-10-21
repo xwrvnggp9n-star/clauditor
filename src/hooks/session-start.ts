@@ -187,7 +187,7 @@ async function buildSessionStartContext(
 
     const store = new SessionStore()
     const watcher = new SessionWatcher(store, { projectsDir })
-    await watcher.scanAll()
+    await watcher.scanRecent(30, 14 * 24 * 60 * 60 * 1000)
 
     const sessions = store.getAll()
     const patterns = detectWorkflowPatterns(sessions)

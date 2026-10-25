@@ -7,6 +7,7 @@ import { detectCacheDegradation } from '../features/cache-health.js'
 import { hasResumeBoundary, detectResumeAnomaly } from '../features/resume-detector.js'
 import { logActivity } from '../features/activity-log.js'
 import { readStdin, outputDecision, pruneStaleStateFiles } from './shared.js'
+import { pruneStaleDesktopMarkers } from '../features/desktop-gate.js'
 
 /**
  * SessionStart hook handler.
@@ -31,6 +32,7 @@ export async function handleSessionStartHook(): Promise<void> {
 
   // Prune stale state files — lightweight, runs once per session start
   try { pruneStaleStateFiles() } catch {}
+  try { pruneStaleDesktopMarkers() } catch {}
 
   const context = await buildSessionStartContext(hookInput.cwd, hookInput.session_id)
   outputDecision(context)

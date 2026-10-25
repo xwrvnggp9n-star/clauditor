@@ -194,6 +194,73 @@ program
     }
   })
 
+// ─── clauditor desktop ───────────────────────────────────────────
+
+const desktopCmd = program
+  .command('desktop')
+  .description('Turn clauditor hooks on/off in Claude desktop app sessions (off by default)')
+
+function desktopSessionId(opts: { session?: string }): string {
+  const id = opts.session ?? process.env.CLAUDE_CODE_SESSION_ID
+  if (!id) {
+    console.error('  No session ID: run this from inside the desktop session, or pass --session <id>.')
+    process.exit(1)
+  }
+  return id
+}
+
+desktopCmd
+  .command('on')
+  .description('Enable hooks for this desktop session (--global: every desktop session)')
+  .option('--session <id>', 'Session ID (default: $CLAUDE_CODE_SESSION_ID)')
+  .option('--global', 'Enable for every desktop app session')
+  .action(async (opts: { session?: string; global?: boolean }) => {
+    const { enableSession, setGlobalEnabled } = await import('./features/desktop-gate.js')
+    if (opts.global) {
+      setGlobalEnabled(true)
+      console.log('  clauditor is now on in every Claude desktop app session.')
+      return
+    }
+    const id = desktopSessionId(opts)
+    enableSession(id)
+    console.log(`  clauditor is on for desktop session ${id} (from its next hook call).`)
+  })
+
+desktopCmd
+  .command('off')
+  .description('Disable hooks for this desktop session (--global: back to off by default)')
+  .option('--session <id>', 'Session ID (default: $CLAUDE_CODE_SESSION_ID)')
+  .option('--global', 'Return every desktop app session to off-by-default')
+  .action(async (opts: { session?: string; global?: boolean }) => {
+    const { disableSession, setGlobalEnabled } = await import('./features/desktop-gate.js')
+    if (opts.global) {
+      setGlobalEnabled(false)
+      console.log('  clauditor is off by default in Claude desktop app sessions again.')
+      return
+    }
+    const id = desktopSessionId(opts)
+    disableSession(id)
+    console.log(`  clauditor is off for desktop session ${id}.`)
+  })
+
+desktopCmd
+  .command('status')
+  .description('Show whether clauditor runs in desktop app sessions')
+  .action(async () => {
+    const { readConfig } = await import('./config.js')
+    const { isDesktopSession, isSessionEnabled } = await import('./features/desktop-gate.js')
+    const global = readConfig().desktopApp.enabled
+    console.log(`  Desktop app default: ${global ? 'on (desktopApp.enabled)' : 'off'}`)
+    const id = process.env.CLAUDE_CODE_SESSION_ID
+    if (!process.env.CLAUDE_CODE_ENTRYPOINT) {
+      console.log('  This session: not inside Claude Code')
+    } else if (!isDesktopSession(process.env)) {
+      console.log(`  This session: ${process.env.CLAUDE_CODE_ENTRYPOINT} (always on)`)
+    } else {
+      console.log(`  This session: desktop app, ${global || isSessionEnabled(id) ? 'on' : 'off'}`)
+    }
+  })
+
 // ─── clauditor login ─────────────────────────────────────────────
 
 const DEFAULT_HUB_URL = 'https://www.clauditor.ai'
@@ -1593,6 +1660,15 @@ program
 const hookCmd = program
   .command('hook')
   .description('Internal hook handlers (called by Claude Code)')
+  .hook('preAction', async () => {
+    // Claude desktop app sessions: every hook is a silent no-op unless opted in
+    if (process.env.CLAUDE_CODE_ENTRYPOINT && process.env.CLAUDE_CODE_ENTRYPOINT !== 'claude-desktop') return
+    const { readStdin } = await import('./hooks/shared.js')
+    const { shouldSkipHook } = await import('./features/desktop-gate.js')
+    let hookInput: { session_id?: string; transcript_path?: string } = {}
+    try { hookInput = JSON.parse(await readStdin()) } catch {}
+    if (shouldSkipHook(process.env, hookInput)) process.exit(0)
+  })
 
 hookCmd
   .command('stop')

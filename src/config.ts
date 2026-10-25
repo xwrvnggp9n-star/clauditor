@@ -26,6 +26,10 @@ export interface ClauditorUserConfig {
   notifications: {
     desktop: boolean
   }
+  /** Claude desktop app sessions: hooks are no-ops there unless enabled */
+  desktopApp: {
+    enabled: boolean
+  }
   /** Per-project hub config, keyed by normalized git remote URL */
   projects?: Record<string, ProjectHubConfig>
 }
@@ -40,6 +44,9 @@ const DEFAULTS: ClauditorUserConfig = {
   notifications: {
     desktop: true,
   },
+  desktopApp: {
+    enabled: false,
+  },
 }
 
 /**
@@ -52,6 +59,7 @@ export function readConfig(): ClauditorUserConfig {
     return {
       rotation: { ...DEFAULTS.rotation, ...raw.rotation },
       notifications: { ...DEFAULTS.notifications, ...raw.notifications },
+      desktopApp: { ...DEFAULTS.desktopApp, ...raw.desktopApp },
       projects: raw.projects ? { ...raw.projects } : undefined,
     }
   } catch {

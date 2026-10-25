@@ -4,17 +4,21 @@ import { homedir } from 'node:os'
 import { randomBytes } from 'node:crypto'
 import type { HookDecision } from '../types.js'
 
+let stdinPromise: Promise<string> | null = null
+
 /**
- * Read JSON from stdin — used by all hooks.
+ * Read JSON from stdin — used by all hooks. Memoized: the desktop-app gate in
+ * cli.ts reads stdin before the hook module does, and both get the same data.
  */
 export function readStdin(): Promise<string> {
-  return new Promise((resolve, reject) => {
+  stdinPromise ??= new Promise((resolve, reject) => {
     let data = ''
     process.stdin.setEncoding('utf-8')
     process.stdin.on('data', (chunk: string) => (data += chunk))
     process.stdin.on('end', () => resolve(data))
     process.stdin.on('error', reject)
   })
+  return stdinPromise
 }
 
 /**

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { EventEmitter } from 'node:events'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -16,7 +16,7 @@ vi.mock('../features/activity-log.js', () => ({
   logActivity: () => Promise.resolve(),
 }))
 
-import { runLoop, parseRunArgs, continuePrompt } from './run.js'
+import { runLoop, parseRunArgs, continuePrompt, pickSessionTitle, sessionTitle } from './run.js'
 import type { RunOptions } from './run.js'
 
 type FakeChild = EventEmitter & { kill: (sig: string) => void; killedWith: string[] }
@@ -45,6 +45,7 @@ function base(extra: Partial<RunOptions> = {}): RunOptions {
     persistentArgs: ['--dangerously-skip-permissions', '--chrome'],
     firstArgs: ['-w', 'fix the bug'],
     markerPath: marker,
+    projectsDir: join(dir, 'projects'),
     pollMs: 5,
     settleMs: 5,
     ...extra,
@@ -118,6 +119,36 @@ describe('runLoop', () => {
     // -w and the original prompt are NOT repeated; the worktree is reopened via cwd
     expect(args).toEqual(['--dangerously-skip-permissions', '--chrome', '/clauditor continue now add tests'])
     expect(spawnOpts.cwd).toBe(dir)
+  })
+
+  it('carries the outgoing session title over with --name', async () => {
+    slowClock()
+    mkdirSync(join(dir, 'projects', '-proj'), { recursive: true })
+    writeFileSync(join(dir, 'projects', '-proj', 'abcdef1234.jsonl'),
+      JSON.stringify({ type: 'ai-title', aiTitle: 'History tab win/loss KPIs', sessionId: 'abcdef1234' }) + '\n')
+    mockSpawn
+      .mockImplementationOnce(() => fakeClaude({ onStart: () => writeReady() }))
+      .mockImplementationOnce(() => fakeClaude({ exitAfterMs: 0 }))
+
+    await runLoop(base())
+
+    const [, args] = mockSpawn.mock.calls[1]
+    expect(args).toEqual(['--dangerously-skip-permissions', '--chrome', '--name', 'History tab win/loss KPIs', '/clauditor continue'])
+  })
+
+  it('does not add --name when the user already passed one', async () => {
+    slowClock()
+    mkdirSync(join(dir, 'projects', '-proj'), { recursive: true })
+    writeFileSync(join(dir, 'projects', '-proj', 'abcdef1234.jsonl'),
+      JSON.stringify({ type: 'ai-title', aiTitle: 'Something', sessionId: 'abcdef1234' }) + '\n')
+    mockSpawn
+      .mockImplementationOnce(() => fakeClaude({ onStart: () => writeReady() }))
+      .mockImplementationOnce(() => fakeClaude({ exitAfterMs: 0 }))
+
+    await runLoop(base({ persistentArgs: ['--name', 'Mine'] }))
+
+    const [, args] = mockSpawn.mock.calls[1]
+    expect(args).toEqual(['--name', 'Mine', '/clauditor continue'])
   })
 
   it('does not act on a pending marker (Claude still writing its handoff)', async () => {
@@ -194,5 +225,49 @@ describe('continuePrompt', () => {
   it('appends the refused prompt when there is one', () => {
     expect(continuePrompt(null)).toBe('/clauditor continue')
     expect(continuePrompt('ship it')).toBe('/clauditor continue ship it')
+  })
+})
+
+describe('pickSessionTitle', () => {
+  const line = (o: object) => JSON.stringify(o)
+
+  it('prefers the last custom title over the AI title', () => {
+    const j = [
+      line({ type: 'ai-title', aiTitle: 'AI one' }),
+      line({ type: 'custom-title', customTitle: 'Old name' }),
+      line({ type: 'custom-title', customTitle: 'Renamed' }),
+      line({ type: 'ai-title', aiTitle: 'AI two' }),
+    ].join('\n')
+    expect(pickSessionTitle(j)).toBe('Renamed')
+  })
+
+  it('falls back to the last AI title', () => {
+    const j = [line({ type: 'ai-title', aiTitle: 'First' }), line({ type: 'ai-title', aiTitle: 'Second' })].join('\n')
+    expect(pickSessionTitle(j)).toBe('Second')
+  })
+
+  it('never carries a handoff-style title', () => {
+    expect(pickSessionTitle(line({ type: 'ai-title', aiTitle: 'Clauditor session handoff' }))).toBeNull()
+    expect(pickSessionTitle(line({ type: 'ai-title', aiTitle: 'Clauditor session handoff and resume' }))).toBeNull()
+    expect(pickSessionTitle([
+      line({ type: 'custom-title', customTitle: 'Clauditor session handoff' }),
+      line({ type: 'ai-title', aiTitle: 'Real work' }),
+    ].join('\n'))).toBe('Real work')
+  })
+
+  it('ignores junk lines and returns null with no title', () => {
+    expect(pickSessionTitle('not json -title"\n{"type":"user"}')).toBeNull()
+  })
+})
+
+describe('sessionTitle', () => {
+  it('returns null for a missing transcript or an unsafe id', () => {
+    const d = mkdtempSync(join(tmpdir(), 'clauditor-title-'))
+    try {
+      expect(sessionTitle('nope', d)).toBeNull()
+      expect(sessionTitle('../x', d)).toBeNull()
+    } finally {
+      rmSync(d, { recursive: true, force: true })
+    }
   })
 })

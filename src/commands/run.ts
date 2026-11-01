@@ -1,7 +1,7 @@
 import { spawn, execSync } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
-import { readFileSync, existsSync, rmSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { readFileSync, existsSync, rmSync, readdirSync } from 'node:fs'
+import { resolve, join } from 'node:path'
 import { homedir } from 'node:os'
 import { logActivity } from '../features/activity-log.js'
 import { ROTATE_ENV, readRotateMarker } from '../features/auto-rotate.js'
@@ -21,6 +21,8 @@ export interface RunOptions {
   pollMs?: number
   /** wait after `ready` before ending claude, so the hook output/handoff lands */
   settleMs?: number
+  /** Claude Code transcript root, for carrying the session title across restarts */
+  projectsDir?: string
 }
 
 export interface RunResult {
@@ -100,7 +102,17 @@ export async function runLoop(opts: RunOptions): Promise<RunResult> {
 
     restarts++
     if (rotation.cwd && existsSync(rotation.cwd)) cwd = rotation.cwd
-    args = [...opts.persistentArgs, continuePrompt(rotation.prompt)]
+    // Carry the outgoing session's title over. Without it Claude Code titles
+    // the fresh session from `/clauditor continue`, and every rotated window
+    // ends up named "Clauditor session handoff".
+    const title = hasNameFlag(opts.persistentArgs)
+      ? null
+      : sessionTitle(rotation.sessionId, opts.projectsDir)
+    args = [
+      ...opts.persistentArgs,
+      ...(title ? ['--name', title] : []),
+      continuePrompt(rotation.prompt),
+    ]
 
     console.log(`\n  clauditor: context limit reached — resuming in a fresh session (${restarts}/${opts.maxRestarts})...\n`)
     logActivity({
@@ -133,6 +145,49 @@ export function parseRunArgs(argv: string[]): { maxRestarts: number; persistentA
 
 export function continuePrompt(refused: string | null): string {
   return refused ? `/clauditor continue ${refused}` : '/clauditor continue'
+}
+
+/** Titles Claude Code generates from the resume command itself; never worth keeping. */
+const HANDOFF_TITLE = /clauditor\s+(session\s+)?(handoff|continue|resume)/i
+
+function hasNameFlag(args: string[]): boolean {
+  return args.some((a) => a === '-n' || a === '--name' || a.startsWith('--name='))
+}
+
+/**
+ * Pick the title to carry over from a transcript's JSONL: the last
+ * user-set title (`/rename`, `--name`) wins, then the last AI title.
+ * Returns null for handoff-style titles so they never propagate.
+ */
+export function pickSessionTitle(jsonl: string): string | null {
+  let custom: string | null = null
+  let ai: string | null = null
+  for (const line of jsonl.split('\n')) {
+    if (!line.includes('-title"')) continue
+    try {
+      const e = JSON.parse(line)
+      if (e.type === 'custom-title' && typeof e.customTitle === 'string') custom = e.customTitle
+      else if (e.type === 'ai-title' && typeof e.aiTitle === 'string') ai = e.aiTitle
+    } catch {}
+  }
+  for (const t of [custom, ai]) {
+    const clean = t?.trim()
+    if (clean && !HANDOFF_TITLE.test(clean)) return clean
+  }
+  return null
+}
+
+/** Find `<sessionId>.jsonl` under ~/.claude/projects and read its title. */
+export function sessionTitle(sessionId: string, projectsDir?: string): string | null {
+  if (!/^[\w-]+$/.test(sessionId)) return null
+  const root = projectsDir ?? resolve(homedir(), '.claude', 'projects')
+  try {
+    for (const dir of readdirSync(root)) {
+      const file = join(root, dir, `${sessionId}.jsonl`)
+      if (existsSync(file)) return pickSessionTitle(readFileSync(file, 'utf-8'))
+    }
+  } catch {}
+  return null
 }
 
 /**

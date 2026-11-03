@@ -180,6 +180,19 @@ describe('runLoop', () => {
     expect(mockSpawn).toHaveBeenCalledTimes(3) // 1 initial + 2 restarts
   })
 
+  it('keeps restarting past 10 when uncapped, then stops when claude exits', async () => {
+    slowClock()
+    let launches = 0
+    mockSpawn.mockImplementation(() => {
+      launches++
+      return launches <= 12 ? fakeClaude({ onStart: () => writeReady() }) : fakeClaude({ exitAfterMs: 0 })
+    })
+
+    const result = await runLoop(base({ maxRestarts: Infinity }))
+
+    expect(result).toEqual({ exitCode: 0, restarts: 12, reason: 'normal_exit' })
+  })
+
   it('treats a rotation within seconds of launch as a loop and stops', async () => {
     vi.spyOn(Date, 'now').mockReturnValue(1000)
     mockSpawn.mockImplementation(() => fakeClaude({ onStart: () => writeReady() }))
@@ -204,7 +217,7 @@ describe('runLoop', () => {
 describe('parseRunArgs', () => {
   it('splits persistent flags from first-launch args at --', () => {
     expect(parseRunArgs(['--dangerously-skip-permissions', '--chrome', '--', '-w', 'do X'])).toEqual({
-      maxRestarts: 10,
+      maxRestarts: Infinity,
       persistentArgs: ['--dangerously-skip-permissions', '--chrome'],
       firstArgs: ['-w', 'do X'],
     })
@@ -214,6 +227,12 @@ describe('parseRunArgs', () => {
     expect(parseRunArgs(['--max-restarts', '4', '--chrome']).maxRestarts).toBe(4)
     expect(parseRunArgs(['--max-restarts=6']).maxRestarts).toBe(6)
     expect(parseRunArgs(['--max-restarts', '4', '--chrome']).persistentArgs).toEqual(['--chrome'])
+  })
+
+  it('has no restart cap unless one is asked for', () => {
+    expect(parseRunArgs([]).maxRestarts).toBe(Infinity)
+    expect(parseRunArgs(['--max-restarts', 'x']).maxRestarts).toBe(Infinity)
+    expect(parseRunArgs(['--max-restarts=0']).maxRestarts).toBe(Infinity)
   })
 
   it('leaves --max-restarts after -- alone', () => {

@@ -11,6 +11,7 @@ const MIN_SESSION_MS = 5000 // a rotation <5s after launch looks like a loop —
 const KILL_GRACE_MS = 5000  // SIGTERM → SIGKILL if claude hasn't exited
 
 export interface RunOptions {
+  /** Infinity (the default) means no cap; the crash-loop guard still applies */
   maxRestarts: number
   /** claude flags reused on every launch (before `--` on the command line) */
   persistentArgs: string[]
@@ -114,11 +115,12 @@ export async function runLoop(opts: RunOptions): Promise<RunResult> {
       continuePrompt(rotation.prompt),
     ]
 
-    console.log(`\n  clauditor: context limit reached — resuming in a fresh session (${restarts}/${opts.maxRestarts})...\n`)
+    const count = Number.isFinite(opts.maxRestarts) ? `${restarts}/${opts.maxRestarts}` : `${restarts}`
+    console.log(`\n  clauditor: context limit reached — resuming in a fresh session (${count})...\n`)
     logActivity({
       type: 'auto_rotation',
       session: rotation.sessionId.slice(0, 8),
-      message: `Auto-restarted session (${restarts}/${opts.maxRestarts})`,
+      message: `Auto-restarted session (${count})`,
     }).catch(() => {})
   }
 }
@@ -132,12 +134,16 @@ export function parseRunArgs(argv: string[]): { maxRestarts: number; persistentA
   const sep = argv.indexOf('--')
   const before = sep === -1 ? argv : argv.slice(0, sep)
   const firstArgs = sep === -1 ? [] : argv.slice(sep + 1)
-  let maxRestarts = 10
+  // No cap by default: a long working day can rotate many times, and a cap
+  // just strands the session at the context block. The <5s crash-loop guard
+  // in runLoop is what stops a runaway. --max-restarts opts into a cap.
+  let maxRestarts = Infinity
+  const cap = (v: string | undefined) => { const n = parseInt(v ?? '', 10); return n > 0 ? n : Infinity }
   const persistentArgs: string[] = []
   for (let i = 0; i < before.length; i++) {
     const a = before[i]
-    if (a === '--max-restarts') { maxRestarts = parseInt(before[++i], 10) || 10; continue }
-    if (a.startsWith('--max-restarts=')) { maxRestarts = parseInt(a.split('=')[1], 10) || 10; continue }
+    if (a === '--max-restarts') { maxRestarts = cap(before[++i]); continue }
+    if (a.startsWith('--max-restarts=')) { maxRestarts = cap(a.split('=')[1]); continue }
     persistentArgs.push(a)
   }
   return { maxRestarts, persistentArgs, firstArgs }

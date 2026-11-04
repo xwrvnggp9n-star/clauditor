@@ -8,6 +8,8 @@ import { hasResumeBoundary, detectResumeAnomaly } from '../features/resume-detec
 import { logActivity } from '../features/activity-log.js'
 import { readStdin, outputDecision, pruneStaleStateFiles } from './shared.js'
 import { pruneStaleDesktopMarkers } from '../features/desktop-gate.js'
+import { autoRotateFile, notWrappedWarning } from '../features/auto-rotate.js'
+import { readConfig } from '../config.js'
 
 /**
  * SessionStart hook handler.
@@ -22,7 +24,7 @@ import { pruneStaleDesktopMarkers } from '../features/desktop-gate.js'
  */
 export async function handleSessionStartHook(): Promise<void> {
   const input = await readStdin()
-  let hookInput: { session_id: string; cwd?: string }
+  let hookInput: { session_id: string; cwd?: string; source?: string }
   try {
     hookInput = JSON.parse(input)
   } catch {
@@ -35,7 +37,8 @@ export async function handleSessionStartHook(): Promise<void> {
   try { pruneStaleDesktopMarkers() } catch {}
 
   const context = await buildSessionStartContext(hookInput.cwd, hookInput.session_id)
-  outputDecision(context)
+  const warning = startupRotationWarning(hookInput.source, hookInput.cwd ?? null)
+  outputDecision(warning ? { ...context, systemMessage: warning } : context)
 }
 
 async function buildSessionStartContext(
@@ -225,6 +228,18 @@ async function buildSessionStartContext(
 
   if (parts.length === 0) return {}
   return { additionalContext: parts.join('\n\n') }
+}
+
+/**
+ * A fresh or resumed session outside `clauditor run` will hit the context
+ * block and just stop — say so up front, while it's cheap to relaunch.
+ */
+export function startupRotationWarning(source: string | undefined, cwd: string | null): string | null {
+  if (source !== 'startup' && source !== 'resume') return null
+  if (autoRotateFile()) return null
+  const { rotation } = readConfig()
+  if (!rotation.enabled || !(rotation.contextBlockPct > 0)) return null
+  return notWrappedWarning(cwd, rotation.resumeCommand)
 }
 
 /**

@@ -22,6 +22,8 @@ export interface ClauditorUserConfig {
     minTurns: number
     /** Also rotate once context reaches this % of the model's window (0 = off) */
     contextBlockPct: number
+    /** Command shown for resuming when the session isn't under `clauditor run` */
+    resumeCommand: string
   }
   notifications: {
     desktop: boolean
@@ -40,6 +42,7 @@ const DEFAULTS: ClauditorUserConfig = {
     threshold: 100_000,
     minTurns: 30,
     contextBlockPct: 0,
+    resumeCommand: 'clauditor run -- "/clauditor continue"',
   },
   notifications: {
     desktop: true,

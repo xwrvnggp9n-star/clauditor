@@ -16,7 +16,7 @@ import { saveSessionState, extractSessionStateFromTranscript, findTranscriptPath
 import { readConfig } from '../config.js'
 import { contextLimitForModel, contextSizeOf, exceedsContextPct } from '../features/context-limit.js'
 import { loadCalibration } from '../features/calibration.js'
-import { requestRotation } from '../features/auto-rotate.js'
+import { requestRotation, manualRestartSteps } from '../features/auto-rotate.js'
 import { readStdin, outputDecision, writeJsonFileAtomic, readJsonFile } from './shared.js'
 
 /**
@@ -686,8 +686,8 @@ function checkSessionRotationBlock(sessionId: string, turns: TurnMetrics[], mode
       `1. Tell the user: this session is burning ${wasteFactor}x more quota than necessary. ` +
       (autoRestart
         ? `Their progress is saved and a fresh session will start automatically when you stop.\n`
-        : `Their progress is saved. Run \`claude\` to start fresh at ~${Math.round(baseline / 1000)}k tokens/turn instead of ${Math.round(current / 1000)}k.\n`) +
-      handoffInstructions(autoRestart),
+        : `Their progress is saved.\n`) +
+      handoffInstructions(autoRestart, stateData?.cwd ?? null),
   }
 }
 
@@ -738,16 +738,17 @@ function checkContextPctBlock(
       `1. Tell the user: context is ${pct}% full and every turn now re-sends ${k}k tokens. ` +
       (autoRestart
         ? `Their progress is saved and a fresh session will start automatically when you stop.\n`
-        : `Their progress is saved. Run \`claude\` to start fresh.\n`) +
-      handoffInstructions(autoRestart),
+        : `Their progress is saved.\n`) +
+      handoffInstructions(autoRestart, stateData?.cwd ?? null),
   }
 }
 
-function handoffInstructions(autoRestart: boolean): string {
+function handoffInstructions(autoRestart: boolean, cwd: string | null): string {
   return HANDOFF_FORMAT +
     (autoRestart
       ? `3. Do not start any new work after the handoff — end your turn so the restart can happen.\n`
-      : `3. In the new session, tell the user to just say "continue where I left off" — clauditor will inject the saved context automatically.\n`) +
+      : `3. End your response by giving the user these exact steps, word for word, with the two commands in a code block:\n\n` +
+        manualRestartSteps(cwd, readConfig().rotation.resumeCommand) + `\n\n`) +
     `4. Include the marker [clauditor-rotation] at the end of your response so clauditor can capture your summary.`
 }
 

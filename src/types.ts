@@ -211,6 +211,8 @@ export interface HookDecision {
   decision?: 'block' | 'approve'
   reason?: string
   additionalContext?: string
+  /** Shown to the user in the Claude Code UI (not sent to the model) */
+  systemMessage?: string
 }
 
 // Model pricing table

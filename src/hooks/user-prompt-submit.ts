@@ -6,7 +6,7 @@ import { contextSizeOf, exceedsContextPct } from '../features/context-limit.js'
 import { homedir } from 'node:os'
 import { resolve } from 'node:path'
 import { logActivity } from '../features/activity-log.js'
-import { requestRotation } from '../features/auto-rotate.js'
+import { requestRotation, manualRestartSteps } from '../features/auto-rotate.js'
 import { readStdin, readJsonFile, writeJsonFileAtomic, findTranscriptPathSync } from './shared.js'
 
 /**
@@ -163,8 +163,8 @@ export async function handleUserPromptSubmitHook(): Promise<void> {
         `  Turns: ${analysis.turns}\n\n` +
         (autoRestart
           ? `Restarting in a fresh session — your message will be sent there.`
-          : `Start fresh: run \`claude\` — clauditor will inject your previous session context.\n` +
-            `Or press Enter to continue in this session (not recommended).`),
+          : manualRestartSteps(hookInput.cwd || analysis.cwd || null, config.rotation.resumeCommand) +
+            `\n\nYour message was not sent — send it again in the new session.`),
     }))
   } catch {
     process.stdout.write('{}')

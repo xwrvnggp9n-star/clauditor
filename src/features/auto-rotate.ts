@@ -27,6 +27,38 @@ export interface RotateMarker {
   at: string
 }
 
+/** Shown when `rotation.resumeCommand` isn't set in ~/.clauditor/config.json */
+export const DEFAULT_RESUME_COMMAND = 'clauditor run -- "/clauditor continue"'
+
+export function shellQuote(s: string): string {
+  return /^[\w@%+=:,./-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`
+}
+
+/**
+ * Outside `clauditor run` nothing restarts claude, so spell out the exact
+ * commands: leave, cd back into this session's directory (a worktree, often),
+ * relaunch under the wrapper. A bare "run `claude`" starts another session
+ * that can't restart either, in whatever directory the terminal happens to be.
+ */
+export function manualRestartSteps(cwd: string | null, resumeCommand: string): string {
+  return [
+    'This session was not started with `clauditor run`, so it cannot restart itself. To pick up where it left off:',
+    '1. Type /exit',
+    '2. In your terminal, run:',
+    '',
+    ...(cwd ? [`cd ${shellQuote(cwd)}`] : []),
+    resumeCommand || DEFAULT_RESUME_COMMAND,
+  ].join('\n')
+}
+
+/** One line for session start: this session won't auto-restart at the cutoff. */
+export function notWrappedWarning(cwd: string | null, resumeCommand: string): string {
+  const cmd = resumeCommand || DEFAULT_RESUME_COMMAND
+  const start = cmd.replace(/(\s+--)?\s+"\/clauditor continue"\s*$/, '')
+  return `clauditor: this session was not started with \`clauditor run\`, so it will NOT restart itself at the context limit. ` +
+    `To fix it now: /exit, then ${cwd ? `cd ${shellQuote(cwd)} && ` : ''}${start}`
+}
+
 export function autoRotateFile(): string | null {
   return process.env[ROTATE_ENV] || null
 }

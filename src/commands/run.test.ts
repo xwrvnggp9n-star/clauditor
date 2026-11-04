@@ -16,7 +16,7 @@ vi.mock('../features/activity-log.js', () => ({
   logActivity: () => Promise.resolve(),
 }))
 
-import { runLoop, parseRunArgs, continuePrompt, pickSessionTitle, sessionTitle } from './run.js'
+import { runLoop, parseRunArgs, continuePrompt, pickSessionTitle, sessionTitle, pickSessionModel, withoutModelFlag } from './run.js'
 import type { RunOptions } from './run.js'
 
 type FakeChild = EventEmitter & { kill: (sig: string) => void; killedWith: string[] }
@@ -149,6 +149,26 @@ describe('runLoop', () => {
 
     const [, args] = mockSpawn.mock.calls[1]
     expect(args).toEqual(['--name', 'Mine', '/clauditor continue'])
+  })
+
+  it('carries the model the outgoing session last used, replacing a launch --model', async () => {
+    slowClock()
+    mkdirSync(join(dir, 'projects', '-proj'), { recursive: true })
+    const ident = (id: string) => JSON.stringify({ type: 'attachment', attachment: { type: 'model', identity: { modelId: id } } })
+    writeFileSync(join(dir, 'projects', '-proj', 'abcdef1234.jsonl'), [
+      JSON.stringify({ type: 'user', message: { content: 'hi' } }),
+      ident('claude-sonnet-5-5'),
+      JSON.stringify({ type: 'user', message: { content: 'switch done' } }),
+      ident('claude-opus-5-5'),
+    ].join('\n') + '\n')
+    mockSpawn
+      .mockImplementationOnce(() => fakeClaude({ onStart: () => writeReady() }))
+      .mockImplementationOnce(() => fakeClaude({ exitAfterMs: 0 }))
+
+    await runLoop(base({ persistentArgs: ['--model', 'sonnet', '--chrome'] }))
+
+    const [, args] = mockSpawn.mock.calls[1]
+    expect(args).toEqual(['--chrome', '--model', 'claude-opus-5-5', '/clauditor continue'])
   })
 
   it('does not act on a pending marker (Claude still writing its handoff)', async () => {
@@ -288,5 +308,47 @@ describe('sessionTitle', () => {
     } finally {
       rmSync(d, { recursive: true, force: true })
     }
+  })
+})
+
+describe('pickSessionModel', () => {
+  const ident = (id: string, extra: object = {}) =>
+    JSON.stringify({ type: 'attachment', attachment: { type: 'model', identity: { modelId: id } }, ...extra })
+  const user = (content: unknown, extra: object = {}) => JSON.stringify({ type: 'user', message: { content }, ...extra })
+
+  it('returns the last identity of a normal turn (a /model switch)', () => {
+    const j = [user('a'), ident('claude-opus-5-5'), user('b'), ident('claude-fable-5-1')].join('\n')
+    expect(pickSessionModel(j)).toBe('claude-fable-5-1')
+  })
+
+  it('skips the model a slash command forces for its own turn', () => {
+    const j = [
+      user('<command-message>clauditor</command-message>\n<command-name>/clauditor</command-name>'),
+      ident('claude-opus-5-5'),
+      user([{ type: 'text', text: 'skill body' }], { isMeta: true }),
+      user([{ type: 'tool_result', content: 'x' }]),
+      ident('claude-sonnet-5-5'),
+    ].join('\n')
+    expect(pickSessionModel(j)).toBe('claude-opus-5-5')
+  })
+
+  it('takes the model back up on the next normal turn', () => {
+    const j = [
+      user('<command-name>/x</command-name>'), ident('claude-opus-5-5'), ident('claude-sonnet-5-5'),
+      user('open the file'), ident('claude-opus-5-5'),
+    ].join('\n')
+    expect(pickSessionModel(j)).toBe('claude-opus-5-5')
+  })
+
+  it('ignores sidechains, junk and unsafe ids; null when there is none', () => {
+    expect(pickSessionModel([ident('claude-opus-5-5'), ident('claude-haiku-5-5', { isSidechain: true })].join('\n'))).toBe('claude-opus-5-5')
+    expect(pickSessionModel(ident('x; rm -rf /'))).toBeNull()
+    expect(pickSessionModel('not json "identity"\n{"type":"user"}')).toBeNull()
+  })
+})
+
+describe('withoutModelFlag', () => {
+  it('drops both --model forms', () => {
+    expect(withoutModelFlag(['--model', 'opus', '--chrome', '--model=sonnet', '-w'])).toEqual(['--chrome', '-w'])
   })
 })

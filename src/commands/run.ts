@@ -106,11 +106,14 @@ export async function runLoop(opts: RunOptions): Promise<RunResult> {
     // Carry the outgoing session's title over. Without it Claude Code titles
     // the fresh session from `/clauditor continue`, and every rotated window
     // ends up named "Clauditor session handoff".
-    const title = hasNameFlag(opts.persistentArgs)
-      ? null
-      : sessionTitle(rotation.sessionId, opts.projectsDir)
+    const transcript = readTranscript(rotation.sessionId, opts.projectsDir)
+    const title = hasNameFlag(opts.persistentArgs) || !transcript ? null : pickSessionTitle(transcript)
+    // Carry the model over too, so a mid-session /model switch survives the
+    // restart instead of falling back to the launch flag or the settings default.
+    const model = transcript ? pickSessionModel(transcript) : null
     args = [
-      ...opts.persistentArgs,
+      ...(model ? withoutModelFlag(opts.persistentArgs) : opts.persistentArgs),
+      ...(model ? ['--model', model] : []),
       ...(title ? ['--name', title] : []),
       continuePrompt(rotation.prompt),
     ]
@@ -183,17 +186,71 @@ export function pickSessionTitle(jsonl: string): string | null {
   return null
 }
 
-/** Find `<sessionId>.jsonl` under ~/.claude/projects and read its title. */
-export function sessionTitle(sessionId: string, projectsDir?: string): string | null {
+/** Find `<sessionId>.jsonl` under ~/.claude/projects and return its text. */
+export function readTranscript(sessionId: string, projectsDir?: string): string | null {
   if (!/^[\w-]+$/.test(sessionId)) return null
   const root = projectsDir ?? resolve(homedir(), '.claude', 'projects')
   try {
     for (const dir of readdirSync(root)) {
       const file = join(root, dir, `${sessionId}.jsonl`)
-      if (existsSync(file)) return pickSessionTitle(readFileSync(file, 'utf-8'))
+      if (existsSync(file)) return readFileSync(file, 'utf-8')
     }
   } catch {}
   return null
+}
+
+/** Find `<sessionId>.jsonl` under ~/.claude/projects and read its title. */
+export function sessionTitle(sessionId: string, projectsDir?: string): string | null {
+  const t = readTranscript(sessionId, projectsDir)
+  return t ? pickSessionTitle(t) : null
+}
+
+const MODEL_ID = /^[\w.\-]+(\[\w+\])?$/
+
+/**
+ * The model the session's own turns last ran on, from the transcript's model
+ * identity attachments (Claude Code writes one at launch and whenever the
+ * model changes). A slash command or skill with `model:` in its frontmatter
+ * also writes one for its own turn, so identities inside a command turn are
+ * skipped, apart from the launch identity when nothing came before it.
+ * Returns null when none is found.
+ */
+export function pickSessionModel(jsonl: string): string | null {
+  let model: string | null = null
+  let inCommandTurn = false
+  for (const line of jsonl.split('\n')) {
+    if (!line.includes('"identity"') && !line.includes('"type":"user"')) continue
+    try {
+      const e = JSON.parse(line)
+      if (e.isSidechain) continue
+      if (e.type === 'user' && !e.isMeta) {
+        const c = e.message?.content
+        const text = typeof c === 'string'
+          ? c
+          : Array.isArray(c) && c.length && c.every((b: { type?: string }) => b?.type === 'text')
+            ? c.map((b: { text?: string }) => b.text ?? '').join('')
+            : null
+        if (text !== null) inCommandTurn = text.includes('<command-name>')
+        continue
+      }
+      if (e.type !== 'attachment' || e.attachment?.type !== 'model') continue
+      const id = e.attachment.identity?.modelId
+      if (typeof id !== 'string' || !MODEL_ID.test(id)) continue
+      if (!inCommandTurn || model === null) model = id
+    } catch {}
+  }
+  return model
+}
+
+/** persistentArgs with any `--model x` / `--model=x` taken out. */
+export function withoutModelFlag(args: string[]): string[] {
+  const out: string[] = []
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--model') { i++; continue }
+    if (args[i].startsWith('--model=')) continue
+    out.push(args[i])
+  }
+  return out
 }
 
 /**

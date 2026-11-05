@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, unlinkSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { resolve, basename } from 'node:path'
+import { isResumeCommandMessage, originalTaskFromHandoff, readSessionOrigin, recordSessionOrigin, truncateTask } from './session-origin.js'
 
 const CLAUDITOR_DIR = resolve(homedir(), '.clauditor')
 const SESSIONS_DIR = resolve(CLAUDITOR_DIR, 'sessions')
@@ -259,6 +260,10 @@ export async function savePostCompactSummary(
             sections.push(`- **Files modified:** ${state.filesModified.slice(0, 20).join(', ')}`)
           }
 
+          if (state.originalTask) {
+            sections.push(``, `## Original Task`, state.originalTask)
+          }
+
           if (state.gitCommits.length > 0) {
             sections.push(``, `## Commits Made`)
             for (const c of state.gitCommits.slice(0, 10)) {
@@ -437,6 +442,19 @@ export function extractHandoffDescription(handoff: HandoffFile): string {
  * cross-project handoffs are always visible.
  * Returns them sorted by timestamp, most recent first.
  */
+/**
+ * The handoff `/clauditor continue` is about to resume is this project's
+ * newest one; file its Original Task under the resuming session's id, so
+ * this session's own handoffs carry the chain's first prompt forward.
+ */
+export function recordOriginFromNewestHandoff(sessionId: string, cwd: string | null): boolean {
+  if (!sessionId || !cwd) return false
+  const newest = readRecentHandoffs(cwd)[0]
+  if (!newest) return false
+  const task = originalTaskFromHandoff(newest.content)
+  return task ? recordSessionOrigin(sessionId, task, newest.path) : false
+}
+
 export function readRecentHandoffs(cwd?: string | null): HandoffFile[] {
   const results: HandoffFile[] = []
   const cutoff = Date.now() - MAX_HANDOFF_AGE_MS
@@ -568,6 +586,7 @@ export function extractSessionStateFromTranscript(
     const keyCommands: string[] = []
     const userMessages: string[] = []
     let originalTask: string | null = null
+    let resumed = false
     let lastAssistantMessage: string | null = null
 
     // Get cwd and branch from most recent user record
@@ -593,6 +612,9 @@ export function extractSessionStateFromTranscript(
           if (msg && !msg.startsWith('<')) {
             userMessages.push(msg)
             if (!originalTask) originalTask = msg
+          } else if (msg && !originalTask && !r.isSidechain && isResumeCommandMessage(msg)) {
+            // Opened with /clauditor continue: the task is the chain's, not ours
+            resumed = true
           }
         }
 
@@ -710,10 +732,13 @@ export function extractSessionStateFromTranscript(
       .slice(-3)
       .map(m => m.slice(0, 200))
 
-    // Truncate original task
-    if (originalTask && originalTask.length > 300) {
-      originalTask = originalTask.slice(0, 300) + '...'
+    // A resumed session repeats the prompt that started the chain (filed by
+    // the UserPromptSubmit hook from the handoff it resumed). The id comes
+    // from the transcript's file name: some callers pass a placeholder.
+    if (resumed) {
+      originalTask = readSessionOrigin(basename(transcriptPath, '.jsonl')) ?? originalTask
     }
+    if (originalTask) originalTask = truncateTask(originalTask)
 
     return {
       savedAt: new Date().toISOString().slice(0, 16).replace('T', ' '),

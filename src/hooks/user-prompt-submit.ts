@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs'
-import { saveSessionState as saveSState, extractSessionStateFromTranscript, readRecentHandoffs, extractHandoffDescription } from '../features/session-state.js'
+import { saveSessionState as saveSState, extractSessionStateFromTranscript, readRecentHandoffs, extractHandoffDescription, recordOriginFromNewestHandoff } from '../features/session-state.js'
 import { readConfig } from '../config.js'
 import { loadCalibration } from '../features/calibration.js'
 import { contextSizeOf, exceedsContextPct } from '../features/context-limit.js'
@@ -8,6 +8,7 @@ import { resolve } from 'node:path'
 import { logActivity } from '../features/activity-log.js'
 import { requestRotation, manualRestartSteps } from '../features/auto-rotate.js'
 import { readStdin, readJsonFile, writeJsonFileAtomic, findTranscriptPathSync } from './shared.js'
+import { isResumePrompt } from '../features/session-origin.js'
 
 /**
  * UserPromptSubmit hook — fires BEFORE Claude processes the user's prompt.
@@ -40,6 +41,11 @@ export async function handleUserPromptSubmitHook(): Promise<void> {
   } catch {
     process.stdout.write('{}')
     return
+  }
+
+  // `/clauditor continue`: carry the chain's original prompt into this session
+  if (hookInput.prompt && isResumePrompt(hookInput.prompt)) {
+    try { recordOriginFromNewestHandoff(hookInput.session_id, hookInput.cwd ?? null) } catch {}
   }
 
   // Check if this is a "continue" prompt — if so, block with handoff context

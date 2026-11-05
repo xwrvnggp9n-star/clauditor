@@ -16,7 +16,10 @@ vi.mock('../features/activity-log.js', () => ({
   logActivity: () => Promise.resolve(),
 }))
 
-import { runLoop, parseRunArgs, continuePrompt, pickSessionTitle, sessionTitle, pickSessionModel, withoutModelFlag } from './run.js'
+import {
+  runLoop, parseRunArgs, continuePrompt, pickSessionTitle, sessionTitle, pickSessionModel, withoutModelFlag,
+  pickSessionEffort, pickSessionUltracode, pickSessionAdvisor, pickSessionCarryOver, withCarryOver, withSettings,
+} from './run.js'
 import type { RunOptions } from './run.js'
 
 type FakeChild = EventEmitter & { kill: (sig: string) => void; killedWith: string[] }
@@ -169,6 +172,30 @@ describe('runLoop', () => {
 
     const [, args] = mockSpawn.mock.calls[1]
     expect(args).toEqual(['--chrome', '--model', 'claude-opus-5-5', '/clauditor continue'])
+  })
+
+  it('carries effort, ultracode and the advisor, merged over a launch --settings', async () => {
+    slowClock()
+    mkdirSync(join(dir, 'projects', '-proj'), { recursive: true })
+    writeFileSync(join(dir, 'projects', '-proj', 'abcdef1234.jsonl'), [
+      JSON.stringify({ type: 'user', message: { content: 'hi' } }),
+      JSON.stringify({ type: 'attachment', attachment: { type: 'model', identity: { modelId: 'claude-opus-5-5' } } }),
+      JSON.stringify({ type: 'attachment', attachment: { type: 'ultra_effort_enter' } }),
+      JSON.stringify({ type: 'attachment', attachment: { type: 'advisor_tool', available: true, model: 'claude-fable-5-1' } }),
+      JSON.stringify({ type: 'api-request', querySource: 'repl_main_thread', params: { model: 'claude-opus-5-5', output_config: { effort: 'max' } } }),
+    ].join('\n') + '\n')
+    mockSpawn
+      .mockImplementationOnce(() => fakeClaude({ onStart: () => writeReady() }))
+      .mockImplementationOnce(() => fakeClaude({ exitAfterMs: 0 }))
+
+    await runLoop(base({ persistentArgs: ['--effort', 'low', '--settings', '{"theme":"dark"}', '--chrome'] }))
+
+    const [, args] = mockSpawn.mock.calls[1]
+    expect(args).toEqual([
+      '--chrome', '--model', 'claude-opus-5-5', '--effort', 'max',
+      '--settings', JSON.stringify({ theme: 'dark', ultracode: true, advisorModel: 'claude-fable-5-1' }),
+      '/clauditor continue',
+    ])
   })
 
   it('does not act on a pending marker (Claude still writing its handoff)', async () => {
@@ -350,5 +377,144 @@ describe('pickSessionModel', () => {
 describe('withoutModelFlag', () => {
   it('drops both --model forms', () => {
     expect(withoutModelFlag(['--model', 'opus', '--chrome', '--model=sonnet', '-w'])).toEqual(['--chrome', '-w'])
+  })
+})
+
+const req = (effort: string, extra: object = {}, model = 'claude-opus-5-5') =>
+  JSON.stringify({ type: 'api-request', querySource: 'repl_main_thread:outputStyle:Concise', params: { model, output_config: { effort } }, ...extra })
+const effortCmd = (level: string, extra: object = {}) =>
+  JSON.stringify({ type: 'user', message: { content: `<local-command-stdout>Set effort level to ${level} (this session only)</local-command-stdout>` }, ...extra })
+const att = (attachment: object, extra: object = {}) => JSON.stringify({ type: 'attachment', attachment, ...extra })
+
+describe('pickSessionEffort', () => {
+  it('takes the last main-thread request for the carried model', () => {
+    expect(pickSessionEffort([req('high'), req('max')].join('\n'), 'claude-opus-5-5')).toBe('max')
+    expect(pickSessionEffort(req('xhigh', { querySource: 'sdk' }), 'claude-opus-5-5')).toBe('xhigh')
+  })
+
+  it('ignores subagent and side-query requests', () => {
+    const j = [req('high'), req('low', { querySource: 'agent:custom' }), req('low', { querySource: 'compact' })].join('\n')
+    expect(pickSessionEffort(j, 'claude-opus-5-5')).toBe('high')
+  })
+
+  it('skips a turn a command ran on another model; [1m] is the same model', () => {
+    const j = [req('xhigh', {}, 'claude-opus-5-5[1m]'), req('low', {}, 'claude-haiku-5-5')].join('\n')
+    expect(pickSessionEffort(j, 'claude-opus-5-5')).toBe('xhigh')
+    expect(pickSessionEffort(req('low', {}, 'claude-haiku-5-5'), 'claude-opus-5-5')).toBeNull()
+  })
+
+  it('a /effort typed after the last request wins; one before it does not', () => {
+    expect(pickSessionEffort([req('high'), effortCmd('max')].join('\n'), 'claude-opus-5-5')).toBe('max')
+    expect(pickSessionEffort([effortCmd('max'), req('high')].join('\n'), 'claude-opus-5-5')).toBe('high')
+    expect(pickSessionEffort(effortCmd('max', { isSidechain: true }), 'claude-opus-5-5')).toBeNull()
+  })
+
+  it('with no carried model, takes any main-thread request', () => {
+    expect(pickSessionEffort(req('medium', {}, 'claude-haiku-5-5'), null)).toBe('medium')
+  })
+
+  it('ignores unknown levels and junk; null when there is none', () => {
+    expect(pickSessionEffort([req('ultra'), 'not json "api-request"'].join('\n'), 'claude-opus-5-5')).toBeNull()
+    expect(pickSessionEffort('', null)).toBeNull()
+  })
+})
+
+describe('pickSessionUltracode', () => {
+  it('follows the last enter/exit record', () => {
+    expect(pickSessionUltracode([att({ type: 'ultra_effort_enter' }), att({ type: 'ultra_effort_exit' })].join('\n'))).toBe(false)
+    expect(pickSessionUltracode([att({ type: 'ultra_effort_exit' }), att({ type: 'ultra_effort_enter' })].join('\n'))).toBe(true)
+  })
+
+  it('ignores sidechains; null when there is none', () => {
+    expect(pickSessionUltracode(att({ type: 'ultra_effort_enter' }, { isSidechain: true }))).toBeNull()
+    expect(pickSessionUltracode(req('high'))).toBeNull()
+  })
+})
+
+describe('pickSessionAdvisor', () => {
+  it('returns the advisor model when on, and the last record wins', () => {
+    const on = att({ type: 'advisor_tool', available: true, model: 'claude-fable-5-1' })
+    const off = att({ type: 'advisor_tool', available: false })
+    expect(pickSessionAdvisor(on)).toBe('claude-fable-5-1')
+    expect(pickSessionAdvisor([on, off].join('\n'))).toBe('')
+    expect(pickSessionAdvisor([off, on].join('\n'))).toBe('claude-fable-5-1')
+  })
+
+  it('a byBase record (model cannot use one) says nothing', () => {
+    const on = att({ type: 'advisor_tool', available: true, model: 'claude-fable-5-1' })
+    expect(pickSessionAdvisor([on, att({ type: 'advisor_tool', available: false, byBase: true })].join('\n'))).toBe('claude-fable-5-1')
+    expect(pickSessionAdvisor(att({ type: 'advisor_tool', available: false, byBase: true }))).toBeNull()
+  })
+
+  it('ignores sidechains and unsafe model ids', () => {
+    expect(pickSessionAdvisor(att({ type: 'advisor_tool', available: true, model: 'claude-fable-5-1' }, { isSidechain: true }))).toBeNull()
+    expect(pickSessionAdvisor(att({ type: 'advisor_tool', available: true, model: 'x; rm -rf /' }))).toBeNull()
+  })
+})
+
+describe('pickSessionCarryOver', () => {
+  it('collects all four, effort matched to the carried model', () => {
+    const j = [
+      JSON.stringify({ type: 'user', message: { content: 'hi' } }),
+      att({ type: 'model', identity: { modelId: 'claude-opus-5-5' } }),
+      req('xhigh'), att({ type: 'ultra_effort_exit' }), att({ type: 'advisor_tool', available: false }),
+    ].join('\n')
+    expect(pickSessionCarryOver(j)).toEqual({ model: 'claude-opus-5-5', effort: 'xhigh', ultracode: false, advisor: '' })
+  })
+})
+
+describe('withCarryOver', () => {
+  const none = { model: null, effort: null, ultracode: null, advisor: null }
+
+  it('leaves args alone with nothing to carry', () => {
+    const args = ['--model', 'opus', '--chrome']
+    expect(withCarryOver(args, null)).toBe(args)
+    expect(withCarryOver(args, none)).toEqual(args)
+  })
+
+  it('replaces --model and --effort in either form', () => {
+    expect(withCarryOver(['--model=sonnet', '--effort', 'low', '-w'], { ...none, model: 'claude-opus-5-5', effort: 'max' }))
+      .toEqual(['-w', '--model', 'claude-opus-5-5', '--effort', 'max'])
+  })
+
+  it('carries ultracode off and the advisor off as explicit settings', () => {
+    expect(withCarryOver([], { ...none, ultracode: false, advisor: '' }))
+      .toEqual(['--settings', JSON.stringify({ ultracode: false, advisorModel: '' })])
+  })
+})
+
+describe('withSettings', () => {
+  let tmp: string
+  beforeEach(() => { tmp = mkdtempSync(join(tmpdir(), 'clauditor-settings-')) })
+  afterEach(() => rmSync(tmp, { recursive: true, force: true }))
+
+  it('adds one --settings when there is none', () => {
+    expect(withSettings(['-w'], { ultracode: true })).toEqual(['-w', '--settings', '{"ultracode":true}'])
+  })
+
+  it('merges over inline JSON in either form, the carried value winning', () => {
+    expect(withSettings(['--settings={"ultracode":false,"theme":"dark"}', '-w'], { ultracode: true }))
+      .toEqual(['-w', '--settings', '{"ultracode":true,"theme":"dark"}'])
+  })
+
+  it('merges over a settings file', () => {
+    const f = join(tmp, 's.json')
+    writeFileSync(f, '{"model":"opus"}')
+    expect(withSettings(['--settings', f], { advisorModel: 'claude-fable-5-1' }))
+      .toEqual(['--settings', '{"model":"opus","advisorModel":"claude-fable-5-1"}'])
+  })
+
+  it('keeps the user\'s flag untouched when it cannot be read', () => {
+    const args = ['--settings', join(tmp, 'missing.json'), '-w']
+    expect(withSettings(args, { ultracode: true })).toBe(args)
+    const bad = ['--settings', '{not json', '-w']
+    expect(withSettings(bad, { ultracode: true })).toBe(bad)
+    const arr = ['--settings', '[1]']
+    expect(withSettings(arr, { ultracode: true })).toBe(arr)
+  })
+
+  it('does nothing with no extra settings', () => {
+    const args = ['--settings', '{not json']
+    expect(withSettings(args, {})).toBe(args)
   })
 })

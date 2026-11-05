@@ -108,12 +108,12 @@ export async function runLoop(opts: RunOptions): Promise<RunResult> {
     // ends up named "Clauditor session handoff".
     const transcript = readTranscript(rotation.sessionId, opts.projectsDir)
     const title = hasNameFlag(opts.persistentArgs) || !transcript ? null : pickSessionTitle(transcript)
-    // Carry the model over too, so a mid-session /model switch survives the
-    // restart instead of falling back to the launch flag or the settings default.
-    const model = transcript ? pickSessionModel(transcript) : null
+    // Carry the model, effort, ultracode and advisor over too, so a
+    // mid-session /model, /effort or /advisor change survives the restart
+    // instead of falling back to the launch flags or the settings defaults.
+    const carried = transcript ? pickSessionCarryOver(transcript) : null
     args = [
-      ...(model ? withoutModelFlag(opts.persistentArgs) : opts.persistentArgs),
-      ...(model ? ['--model', model] : []),
+      ...withCarryOver(opts.persistentArgs, carried),
       ...(title ? ['--name', title] : []),
       continuePrompt(rotation.prompt),
     ]
@@ -242,15 +242,171 @@ export function pickSessionModel(jsonl: string): string | null {
   return model
 }
 
-/** persistentArgs with any `--model x` / `--model=x` taken out. */
-export function withoutModelFlag(args: string[]): string[] {
+/** args with any `<flag> x` / `<flag>=x` taken out. */
+export function withoutFlag(args: string[], flag: string): string[] {
   const out: string[] = []
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === '--model') { i++; continue }
-    if (args[i].startsWith('--model=')) continue
+    if (args[i] === flag) { i++; continue }
+    if (args[i].startsWith(flag + '=')) continue
     out.push(args[i])
   }
   return out
+}
+
+/** persistentArgs with any `--model x` / `--model=x` taken out. */
+export function withoutModelFlag(args: string[]): string[] {
+  return withoutFlag(args, '--model')
+}
+
+const EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max'])
+
+/** `claude-opus-5-5[1m]` and `claude-opus-5-5` are the same model for effort. */
+const baseModel = (id: string) => id.replace(/\[\w+\]$/, '')
+
+/** The main conversation's requests, not a subagent's or a side query's. */
+const isMainThreadQuery = (src: unknown) =>
+  typeof src === 'string' && (src === 'sdk' || src.startsWith('repl_main_thread'))
+
+/**
+ * The effort level the session last ran `model` at, from the transcript's
+ * `api-request` records (Claude Code writes the request params, including
+ * `output_config.effort`, for each main-thread call). A `/effort <level>`
+ * typed after the last request wins, since nothing has used it yet.
+ * Returns null when neither is found.
+ */
+export function pickSessionEffort(jsonl: string, model: string | null): string | null {
+  let fromRequest: string | null = null
+  let fromAnyRequest: string | null = null
+  let fromCommand: string | null = null
+  let requestLine = -1
+  let commandLine = -1
+  const lines = jsonl.split('\n')
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    const isRequest = line.includes('"api-request"')
+    const isCommand = line.includes('local-command-stdout>Set effort level to')
+    if (!isRequest && !isCommand) continue
+    try {
+      const e = JSON.parse(line)
+      if (isRequest && e.type === 'api-request' && isMainThreadQuery(e.querySource)) {
+        const effort = e.params?.output_config?.effort
+        if (typeof effort !== 'string' || !EFFORT_LEVELS.has(effort)) continue
+        fromAnyRequest = effort
+        // A command's `model:` frontmatter can run a turn on another model
+        if (model && baseModel(String(e.params?.model ?? '')) !== baseModel(model)) continue
+        fromRequest = effort
+        requestLine = i
+      } else if (isCommand && e.type === 'user' && !e.isSidechain && typeof e.message?.content === 'string') {
+        const m = e.message.content.match(/^<local-command-stdout>Set effort level to (\w+)/)
+        if (m && EFFORT_LEVELS.has(m[1])) { fromCommand = m[1]; commandLine = i }
+      }
+    } catch {}
+  }
+  if (fromCommand && commandLine > requestLine) return fromCommand
+  return fromRequest ?? (model ? null : fromAnyRequest)
+}
+
+/**
+ * Whether ultracode was on when the session ended: the last
+ * `ultra_effort_enter` / `ultra_effort_exit` record (Claude Code writes one
+ * whenever it turns on or off, including at launch). Null if neither.
+ */
+export function pickSessionUltracode(jsonl: string): boolean | null {
+  let on: boolean | null = null
+  for (const line of jsonl.split('\n')) {
+    if (!line.includes('"ultra_effort_')) continue
+    try {
+      const e = JSON.parse(line)
+      if (e.type !== 'attachment' || e.isSidechain) continue
+      if (e.attachment?.type === 'ultra_effort_enter') on = true
+      else if (e.attachment?.type === 'ultra_effort_exit') on = false
+    } catch {}
+  }
+  return on
+}
+
+/**
+ * The session's advisor, from the last `advisor_tool` record: the advisor
+ * model when on, '' when it was turned off (an empty `advisorModel` turns
+ * it off over the user's settings), null when unknown. `byBase` means only
+ * that the current model can't use an advisor, so it says nothing about
+ * whether the user wants one.
+ */
+export function pickSessionAdvisor(jsonl: string): string | null {
+  let advisor: string | null = null
+  for (const line of jsonl.split('\n')) {
+    if (!line.includes('"advisor_tool"')) continue
+    try {
+      const e = JSON.parse(line)
+      const a = e.attachment
+      if (e.type !== 'attachment' || e.isSidechain || a?.type !== 'advisor_tool') continue
+      if (a.available === true && typeof a.model === 'string' && MODEL_ID.test(a.model)) advisor = a.model
+      else if (a.available === false && !a.byBase) advisor = ''
+    } catch {}
+  }
+  return advisor
+}
+
+export interface CarryOver {
+  model: string | null
+  effort: string | null
+  ultracode: boolean | null
+  advisor: string | null
+}
+
+/** Everything a restart carries over from the outgoing session's transcript. */
+export function pickSessionCarryOver(jsonl: string): CarryOver {
+  const model = pickSessionModel(jsonl)
+  return {
+    model,
+    effort: pickSessionEffort(jsonl, model),
+    ultracode: pickSessionUltracode(jsonl),
+    advisor: pickSessionAdvisor(jsonl),
+  }
+}
+
+/**
+ * persistentArgs with the carried-over state applied: `--model` and
+ * `--effort` replace any given at launch; ultracode and the advisor go in
+ * one `--settings` JSON, merged over any `--settings` given at launch
+ * (inline JSON or a file). If that one can't be read, it's kept as is and
+ * the two settings aren't carried, rather than passing --settings twice.
+ */
+export function withCarryOver(persistentArgs: string[], c: CarryOver | null): string[] {
+  if (!c) return persistentArgs
+  let args = persistentArgs
+  if (c.model) args = [...withoutFlag(args, '--model'), '--model', c.model]
+  if (c.effort) args = [...withoutFlag(args, '--effort'), '--effort', c.effort]
+  const settings: Record<string, unknown> = {}
+  if (c.ultracode !== null) settings.ultracode = c.ultracode
+  if (c.advisor !== null) settings.advisorModel = c.advisor
+  return withSettings(args, settings)
+}
+
+export function withSettings(args: string[], extra: Record<string, unknown>): string[] {
+  if (Object.keys(extra).length === 0) return args
+  const rest: string[] = []
+  let base: Record<string, unknown> = {}
+  for (let i = 0; i < args.length; i++) {
+    let value: string | undefined
+    if (args[i] === '--settings') value = args[++i]
+    else if (args[i].startsWith('--settings=')) value = args[i].slice('--settings='.length)
+    else { rest.push(args[i]); continue }
+    const parsed = value === undefined ? null : readSettingsArg(value)
+    if (!parsed) return args
+    base = { ...base, ...parsed }
+  }
+  return [...rest, '--settings', JSON.stringify({ ...base, ...extra })]
+}
+
+function readSettingsArg(value: string): Record<string, unknown> | null {
+  try {
+    const text = value.trim().startsWith('{') ? value : readFileSync(value, 'utf-8')
+    const o = JSON.parse(text)
+    return o && typeof o === 'object' && !Array.isArray(o) ? o : null
+  } catch {
+    return null
+  }
 }
 
 /**

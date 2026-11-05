@@ -1,8 +1,9 @@
 import { describe, it, expect } from 'vitest'
 import { mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
-import { tmpdir } from 'node:os'
-import { extractSessionStateFromTranscript, saveSessionState, readLastSessionState } from './session-state.js'
+import { tmpdir, homedir } from 'node:os'
+import { extractSessionStateFromTranscript, saveSessionState, readLastSessionState, recordOriginFromNewestHandoff } from './session-state.js'
+import { recordSessionOrigin, readSessionOrigin } from './session-origin.js'
 
 function makeUserRecord(id: string, content: string, extra: Record<string, unknown> = {}) {
   return JSON.stringify({
@@ -179,15 +180,52 @@ describe('extractSessionStateFromTranscript', () => {
     expect(result).toBeNull()
   })
 
-  it('truncates original task to 300 chars', () => {
-    const longTask = 'x'.repeat(500)
+  it('truncates original task to 2000 chars', () => {
+    const longTask = 'x'.repeat(2500)
     const lines = [
       makeUserRecord('1', longTask),
       ...Array.from({ length: 6 }, (_, i) => makeAssistantRecord(`a${i}`, { text: 'ok' })),
     ]
     const result = extractSessionStateFromTranscript('s1', writeSession(lines))
     expect(result).not.toBeNull()
-    expect(result!.originalTask!.length).toBeLessThanOrEqual(303) // 300 + '...'
+    expect(result!.originalTask!.length).toBe(2003) // 2000 + '...'
+  })
+
+  it('a session opened with /clauditor continue takes the chain\'s original task', () => {
+    const resume = '<command-message>clauditor</command-message>\n<command-name>/clauditor</command-name>\n<command-args>continue</command-args>'
+    const lines = [
+      makeUserRecord('1', resume),
+      makeUserRecord('2', 'now also fix the footer'),
+      ...Array.from({ length: 6 }, (_, i) => makeAssistantRecord(`a${i}`, { text: 'ok' })),
+    ]
+    const path = join(tempDir, 'resumed-1234.jsonl')
+    writeFileSync(path, lines.join('\n'))
+    recordSessionOrigin('resumed-1234', 'list all the worktrees and branches', null)
+    expect(extractSessionStateFromTranscript('placeholder', path)!.originalTask).toBe('list all the worktrees and branches')
+  })
+
+  it('a resumed session with no origin on file keeps its own first prompt', () => {
+    const resume = '<command-name>/clauditor</command-name><command-args>continue</command-args>'
+    const lines = [
+      makeUserRecord('1', resume),
+      makeUserRecord('2', 'now also fix the footer'),
+      ...Array.from({ length: 6 }, (_, i) => makeAssistantRecord(`a${i}`, { text: 'ok' })),
+    ]
+    const path = join(tempDir, 'unrecorded-99.jsonl')
+    writeFileSync(path, lines.join('\n'))
+    expect(extractSessionStateFromTranscript('unrecorded-99', path)!.originalTask).toBe('now also fix the footer')
+  })
+
+  it('a session that typed a prompt first ignores any origin on file', () => {
+    const lines = [
+      makeUserRecord('1', 'my own task'),
+      makeUserRecord('2', '<command-name>/clauditor</command-name><command-args>continue</command-args>'),
+      ...Array.from({ length: 6 }, (_, i) => makeAssistantRecord(`a${i}`, { text: 'ok' })),
+    ]
+    const path = join(tempDir, 'typed-first.jsonl')
+    writeFileSync(path, lines.join('\n'))
+    recordSessionOrigin('typed-first', 'someone else\'s task', null)
+    expect(extractSessionStateFromTranscript('typed-first', path)!.originalTask).toBe('my own task')
   })
 
   it('skips meta messages for original task', () => {
@@ -279,5 +317,31 @@ describe('saveSessionState and readLastSessionState', () => {
     expect(content).toContain('## Commits Made')
     expect(content).toContain('## Key Commands & Results')
     expect(content).toContain('## Recent User Messages')
+  })
+})
+
+describe('recordOriginFromNewestHandoff', () => {
+  // vitest.setup.ts points HOME at a temp dir, so this is not the real ~/.clauditor
+  const handoffDir = (cwd: string) =>
+    join(homedir(), '.clauditor', 'sessions', cwd.replace(/[^a-zA-Z0-9]/g, '-').replace(/-+/g, '-'))
+
+  it("files the newest handoff's Original Task under the session id", () => {
+    const cwd = '/work/proj-a'
+    mkdirSync(handoffDir(cwd), { recursive: true })
+    const now = Date.now()
+    writeFileSync(join(handoffDir(cwd), `${now - 60_000}.md`), '# Last Session\n## Original Task\nolder task\n')
+    writeFileSync(join(handoffDir(cwd), `${now}.md`), '# Last Session\n## Original Task\nlist the worktrees\n\n## Task\nx\n')
+    expect(recordOriginFromNewestHandoff('sess-a', cwd)).toBe(true)
+    expect(readSessionOrigin('sess-a')).toBe('list the worktrees')
+  })
+
+  it('records nothing when the newest handoff has no Original Task, or there is none', () => {
+    const cwd = '/work/proj-b'
+    expect(recordOriginFromNewestHandoff('sess-b', cwd)).toBe(false)
+    mkdirSync(handoffDir(cwd), { recursive: true })
+    writeFileSync(join(handoffDir(cwd), `${Date.now()}.md`), '# Last Session\n## Task\nx\n')
+    expect(recordOriginFromNewestHandoff('sess-b', cwd)).toBe(false)
+    expect(readSessionOrigin('sess-b')).toBeNull()
+    expect(recordOriginFromNewestHandoff('sess-b', null)).toBe(false)
   })
 })

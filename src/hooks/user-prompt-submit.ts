@@ -9,6 +9,7 @@ import { logActivity } from '../features/activity-log.js'
 import { requestRotation, manualRestartSteps } from '../features/auto-rotate.js'
 import { readStdin, readJsonFile, writeJsonFileAtomic, findTranscriptPathSync } from './shared.js'
 import { isResumePrompt } from '../features/session-origin.js'
+import { appendRequest, chainRootFor } from '../features/request-log.js'
 
 /**
  * UserPromptSubmit hook — fires BEFORE Claude processes the user's prompt.
@@ -47,6 +48,10 @@ export async function handleUserPromptSubmitHook(): Promise<void> {
   if (hookInput.prompt && isResumePrompt(hookInput.prompt)) {
     try { recordOriginFromNewestHandoff(hookInput.session_id, hookInput.cwd ?? null) } catch {}
   }
+
+  // Log the prompt verbatim to the chain's request log, before anything can
+  // refuse it: a handoff summary may drop an ask, this file never does.
+  appendRequest({ cwd: hookInput.cwd, sessionId: hookInput.session_id, prompt: hookInput.prompt })
 
   // Check if this is a "continue" prompt — if so, block with handoff context
   // Uses exit code 2 + stderr (same as PostToolUse rotation) which works in both CLI and VS Code
@@ -121,6 +126,9 @@ export async function handleUserPromptSubmitHook(): Promise<void> {
         cwd: analysis.cwd,
         originalTask: null,
         recentUserMessages: [],
+        userRequests: [],
+        sessionId,
+        chainRoot: chainRootFor(sessionId),
         gitCommits: [],
         keyCommands: [],
         filesRead: [],

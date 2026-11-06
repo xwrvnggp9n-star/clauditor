@@ -87,6 +87,9 @@ async function buildSessionStartContext(
         `"clauditor: I have context from your previous session${label} (saved ${timeStr}). ` +
         `I can see what you were working on. Want me to continue from there, or are you starting something new?"\n\n` +
         `Wait for the user to respond before taking any action.\n\n` +
+        `If they continue: the handoff's "Open Requests" section and the chain request log it names ` +
+        `(every prompt the user typed, verbatim) are the work queue. List the open items to the user first; ` +
+        `"nothing in progress" with open requests is not "nothing to pick up".\n\n` +
         `Here is the saved context for reference:\n\n` +
         h.content
       )

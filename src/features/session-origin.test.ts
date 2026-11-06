@@ -112,3 +112,23 @@ describe('recordSessionOrigin / readSessionOrigin', () => {
     expect(readSessionOrigin('s1', file)!.length).toBe(ORIGINAL_TASK_MAX + 3)
   })
 })
+
+describe('chain root', () => {
+  it('chainRootFromHandoff reads the Chain line', async () => {
+    const { chainRootFromHandoff } = await import('./session-origin.js')
+    expect(chainRootFromHandoff('# Last Session\n\n- **Branch:** main\n- **Chain:** abc-123_x\n')).toBe('abc-123_x')
+    expect(chainRootFromHandoff('# Last Session\n\n- **Branch:** main\n')).toBeNull()
+  })
+
+  it('recordSessionOrigin files a root, defaulting to the session, and accepts an empty task with a root', async () => {
+    const { readSessionRoot } = await import('./session-origin.js')
+    const file = join(mkdtempSync(join(tmpdir(), 'orig-')), 'origins.json')
+    expect(recordSessionOrigin('s1', 'task', null, file)).toBe(true)
+    expect(readSessionRoot('s1', file)).toBe('s1')
+    expect(recordSessionOrigin('s2', '', null, file, 'root-0')).toBe(true)
+    expect(readSessionRoot('s2', file)).toBe('root-0')
+    expect(readSessionOrigin('s2', file)).toBeNull()
+    expect(recordSessionOrigin('s3', '', null, file)).toBe(false)
+    expect(readSessionRoot('nope', file)).toBeNull()
+  })
+})

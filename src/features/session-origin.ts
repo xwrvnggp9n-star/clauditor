@@ -28,6 +28,8 @@ interface OriginEntry {
   /** the handoff it was copied from */
   from: string | null
   at: string
+  /** the first session of the chain; the request log is keyed by it */
+  root?: string
 }
 
 /** A typed `/clauditor continue …` or `/clauditor resume …` prompt. */
@@ -56,6 +58,12 @@ export function originalTaskFromHandoff(md: string): string | null {
   return task || null
 }
 
+/** The `- **Chain:** <id>` line of a handoff: the chain's root session id. */
+export function chainRootFromHandoff(md: string): string | null {
+  const m = md.match(/^\s*-\s*\*\*Chain:\*\*\s*([A-Za-z0-9_-]+)/m)
+  return m ? m[1] : null
+}
+
 export function truncateTask(task: string): string {
   return task.length > ORIGINAL_TASK_MAX ? task.slice(0, ORIGINAL_TASK_MAX) + '...' : task
 }
@@ -69,21 +77,26 @@ function readOrigins(file: string): Record<string, OriginEntry> {
   }
 }
 
-/** File a session's chain origin. The first one recorded for a session wins. */
+/**
+ * File a session's chain origin. The first one recorded for a session wins.
+ * `task` may be empty when only the chain root is known (an old handoff
+ * with no Original Task); `root` defaults to the session itself.
+ */
 export function recordSessionOrigin(
   sessionId: string,
   task: string,
   from: string | null,
   file: string = ORIGINS_FILE,
+  root: string | null = null,
 ): boolean {
-  if (!sessionId || !task.trim()) return false
+  if (!sessionId || (!task.trim() && !root)) return false
   const all = readOrigins(file)
   if (all[sessionId]) return false
   const cutoff = Date.now() - KEEP_MS
   for (const [id, e] of Object.entries(all)) {
     if (!(Date.parse(e?.at) > cutoff)) delete all[id]
   }
-  all[sessionId] = { task: truncateTask(task.trim()), from, at: new Date().toISOString() }
+  all[sessionId] = { task: truncateTask(task.trim()), from, at: new Date().toISOString(), root: root ?? sessionId }
   try {
     writeJsonFileAtomic(file, all)
     return true
@@ -95,4 +108,10 @@ export function recordSessionOrigin(
 export function readSessionOrigin(sessionId: string, file: string = ORIGINS_FILE): string | null {
   const task = readOrigins(file)[sessionId]?.task
   return typeof task === 'string' && task.trim() ? task : null
+}
+
+/** The chain root filed for a session, or null for a session that started its own chain. */
+export function readSessionRoot(sessionId: string, file: string = ORIGINS_FILE): string | null {
+  const root = readOrigins(file)[sessionId]?.root
+  return typeof root === 'string' && root.trim() ? root : null
 }

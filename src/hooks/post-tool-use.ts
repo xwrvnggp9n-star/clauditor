@@ -17,6 +17,7 @@ import { readConfig } from '../config.js'
 import { contextLimitForModel, contextSizeOf, exceedsContextPct } from '../features/context-limit.js'
 import { loadCalibration } from '../features/calibration.js'
 import { requestRotation, manualRestartSteps } from '../features/auto-rotate.js'
+import { requestLogSummary } from '../features/request-log.js'
 import { readStdin, outputDecision, writeJsonFileAtomic, readJsonFile } from './shared.js'
 
 /**
@@ -687,7 +688,7 @@ function checkSessionRotationBlock(sessionId: string, turns: TurnMetrics[], mode
       (autoRestart
         ? `Their progress is saved and a fresh session will start automatically when you stop.\n`
         : `Their progress is saved.\n`) +
-      handoffInstructions(autoRestart, stateData?.cwd ?? null),
+      handoffInstructions(autoRestart, stateData?.cwd ?? null, requestLogSummary(stateData?.cwd ?? null, sessionId)),
   }
 }
 
@@ -739,12 +740,16 @@ function checkContextPctBlock(
       (autoRestart
         ? `Their progress is saved and a fresh session will start automatically when you stop.\n`
         : `Their progress is saved.\n`) +
-      handoffInstructions(autoRestart, stateData?.cwd ?? null),
+      handoffInstructions(autoRestart, stateData?.cwd ?? null, requestLogSummary(stateData?.cwd ?? null, sessionId)),
   }
 }
 
-function handoffInstructions(autoRestart: boolean, cwd: string | null): string {
-  return HANDOFF_FORMAT +
+function handoffInstructions(autoRestart: boolean, cwd: string | null, log: { path: string; count: number } | null): string {
+  return (log
+      ? `Every prompt the user typed in this chain of sessions (${log.count} so far) is logged verbatim at ${log.path} — ` +
+        `read it (cat) before writing OPEN_REQUESTS so no ask is missing.\n`
+      : ``) +
+    HANDOFF_FORMAT +
     (autoRestart
       ? `3. Do not start any new work after the handoff — end your turn so the restart can happen.\n`
       : `3. End your response by giving the user these exact steps, word for word, with the two commands in a code block:\n\n` +
@@ -755,6 +760,11 @@ function handoffInstructions(autoRestart: boolean, cwd: string | null): string {
 const HANDOFF_FORMAT =
       `2. Write your handoff using EXACTLY this format (clauditor parses these sections to preserve context for the next session):\n\n` +
       `TASK: (one line — what you were working on)\n\n` +
+      `OPEN_REQUESTS:\n- (EVERY ask the user made in this chain of sessions that is not yet shipped AND verified — one bullet each, ` +
+      `in the user's own words where you can, ending with a status word: NOT STARTED / IN PROGRESS / BLOCKED / DONE-UNVERIFIED. ` +
+      `Start from the previous handoff's Open Requests and the chain request log, copy every open item forward, and never drop one: ` +
+      `an item leaves this list only when it is done and verified, and then it goes under COMPLETED with the version that shipped it. ` +
+      `"Nothing in progress" with items still open here is wrong.)\n\n` +
       `COMPLETED:\n- (what's done, one bullet per item)\n\n` +
       `IN_PROGRESS:\n- (what's partially done, include file paths and specific state)\n\n` +
       `FAILED_APPROACHES:\n- (what was tried and didn't work, and WHY — this prevents the next session from repeating mistakes)\n\n` +

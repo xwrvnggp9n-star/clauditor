@@ -1,7 +1,8 @@
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, unlinkSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { resolve, basename } from 'node:path'
-import { isResumeCommandMessage, originalTaskFromHandoff, readSessionOrigin, recordSessionOrigin, truncateTask } from './session-origin.js'
+import { chainRootFromHandoff, isResumeCommandMessage, originalTaskFromHandoff, readSessionOrigin, recordSessionOrigin, truncateTask } from './session-origin.js'
+import { chainRootFor, inlineRequest, requestLogSummary } from './request-log.js'
 
 const CLAUDITOR_DIR = resolve(homedir(), '.clauditor')
 const SESSIONS_DIR = resolve(CLAUDITOR_DIR, 'sessions')
@@ -18,6 +19,7 @@ const LEGACY_SESSION_FILE = resolve(CLAUDITOR_DIR, 'last-session.md')
 const SESSION_INDEX_FILE = resolve(CLAUDITOR_DIR, 'last-session.json')
 
 const MAX_HANDOFF_AGE_MS = 24 * 60 * 60 * 1000 // 24 hours
+const REQUEST_LOG_AGE_MS = 30 * 24 * 60 * 60 * 1000 // 30 days
 
 export interface SessionStateData {
   savedAt: string
@@ -31,6 +33,12 @@ export interface SessionStateData {
   originalTask: string | null
   /** Last 3 user messages (often contain key decisions) */
   recentUserMessages: string[]
+  /** Every request the user typed this session, verbatim and in order (each capped for inline use) */
+  userRequests: string[]
+  /** This session's id (the transcript's file name) */
+  sessionId: string | null
+  /** The first session of this chain of resumes; the request log is keyed by it */
+  chainRoot: string | null
   /** Git commits made during the session */
   gitCommits: string[]
   /** Key bash commands and outcomes (tests, builds, deploys) */
@@ -172,6 +180,7 @@ export function saveSessionState(data: SessionStateData): void {
       `- **Waste factor:** ${data.wasteFactor}x`,
       `- **Files modified:** ${filesList}`,
     ]
+    if (data.chainRoot) sections.push(`- **Chain:** ${data.chainRoot}`)
 
     if (data.filesRead && data.filesRead.length > 0) {
       sections.push(`- **Files read:** ${data.filesRead.slice(0, 15).join(', ')}`)
@@ -195,7 +204,9 @@ export function saveSessionState(data: SessionStateData): void {
       }
     }
 
-    if (data.recentUserMessages && data.recentUserMessages.length > 0) {
+    sections.push(...userRequestsSection(data.userRequests ?? [], data.cwd, data.sessionId))
+
+    if ((!data.userRequests || data.userRequests.length === 0) && data.recentUserMessages && data.recentUserMessages.length > 0) {
       sections.push(``, `## Recent User Messages`)
       for (const msg of data.recentUserMessages) {
         sections.push(`> ${msg}`)
@@ -254,6 +265,7 @@ export async function savePostCompactSummary(
 
           if (state.branch) sections.push(`- **Branch:** ${state.branch}`)
           if (state.cwd) sections.push(`- **Project:** ${state.cwd}`)
+          if (state.chainRoot) sections.push(`- **Chain:** ${state.chainRoot}`)
           sections.push(`- **Session size:** ${state.turns} turns, ${state.tokensPerTurn}k tokens/turn`)
 
           if (state.filesModified.length > 0) {
@@ -277,6 +289,8 @@ export async function savePostCompactSummary(
               sections.push(`- ${c}`)
             }
           }
+
+          sections.push(...userRequestsSection(state.userRequests, state.cwd, state.sessionId))
         }
       } catch {
         // Non-critical — mechanical extraction failed, Claude's prose is still valuable
@@ -289,6 +303,10 @@ export async function savePostCompactSummary(
 
     if (parsed.isStructured) {
       if (parsed.task) sections.push(``, `## Task`, parsed.task)
+      if (parsed.openRequests.length > 0) {
+        sections.push(``, `## Open Requests`, `_Every ask in this chain not yet shipped and verified. The next session carries each one forward until it is done._`)
+        for (const item of parsed.openRequests) sections.push(`- ${item}`)
+      }
       if (parsed.completed.length > 0) {
         sections.push(``, `## Completed`)
         for (const item of parsed.completed) sections.push(`- ${item}`)
@@ -452,7 +470,28 @@ export function recordOriginFromNewestHandoff(sessionId: string, cwd: string | n
   const newest = readRecentHandoffs(cwd)[0]
   if (!newest) return false
   const task = originalTaskFromHandoff(newest.content)
-  return task ? recordSessionOrigin(sessionId, task, newest.path) : false
+  // An older handoff names no chain: the previous session was its chain's
+  // root, but its id is not in the file, so this session starts a new one.
+  const root = chainRootFromHandoff(newest.content)
+  return (task || root) ? recordSessionOrigin(sessionId, task ?? '', newest.path, undefined, root) : false
+}
+
+/**
+ * The verbatim list of what the user asked this session, and a pointer to
+ * the chain's full request log. This is the mechanical answer to asks
+ * going missing across rotations: a summary may drop them, this list cannot.
+ */
+function userRequestsSection(requests: string[], cwd: string | null, sessionId: string | null): string[] {
+  const out: string[] = []
+  const log = requestLogSummary(cwd, sessionId)
+  if (requests.length === 0 && !log) return out
+  out.push(``, `## User Requests (this session, verbatim)`)
+  if (requests.length === 0) out.push(`_No typed requests this session (it was resumed and ran on its own)._`)
+  requests.forEach((r, i) => out.push(`${i + 1}. ${r}`))
+  if (log) {
+    out.push(``, `Chain request log (every prompt since the chain began, ${log.count} so far): ${log.path}`)
+  }
+  return out
 }
 
 export function readRecentHandoffs(cwd?: string | null): HandoffFile[] {
@@ -482,7 +521,15 @@ export function readRecentHandoffs(cwd?: string | null): HandoffFile[] {
 
   for (const dir of dirsToScan) {
     try {
-      const files = readdirSync(dir).filter(f => f.endsWith('.md'))
+      const all = readdirSync(dir)
+      // Request logs outlive handoffs (a chain can run for days); 30 days is plenty
+      for (const f of all) {
+        if (!/^requests-.*\.jsonl$/.test(f)) continue
+        try {
+          if (statSync(resolve(dir, f)).mtimeMs < Date.now() - REQUEST_LOG_AGE_MS) unlinkSync(resolve(dir, f))
+        } catch {}
+      }
+      const files = all.filter(f => f.endsWith('.md'))
       for (const file of files) {
         const filePath = resolve(dir, file)
         try {
@@ -612,9 +659,12 @@ export function extractSessionStateFromTranscript(
           if (msg && !msg.startsWith('<')) {
             userMessages.push(msg)
             if (!originalTask) originalTask = msg
-          } else if (msg && !originalTask && !r.isSidechain && isResumeCommandMessage(msg)) {
+          } else if (msg && !r.isSidechain && isResumeCommandMessage(msg)) {
             // Opened with /clauditor continue: the task is the chain's, not ours
-            resumed = true
+            if (!originalTask) resumed = true
+            // `/clauditor continue <text>` carries the prompt the last session refused
+            const carried = resumeCarriedText(msg)
+            if (carried) userMessages.push(carried)
           }
         }
 
@@ -732,6 +782,11 @@ export function extractSessionStateFromTranscript(
       .slice(-3)
       .map(m => m.slice(0, 200))
 
+    // Every request, verbatim: the summary may drop one, this list may not
+    const userRequests = userMessages.map(inlineRequest)
+    const realSessionId = basename(transcriptPath, '.jsonl')
+    const chainRoot = chainRootFor(realSessionId)
+
     // A resumed session repeats the prompt that started the chain (filed by
     // the UserPromptSubmit hook from the handoff it resumed). The id comes
     // from the transcript's file name: some callers pass a placeholder.
@@ -751,6 +806,9 @@ export function extractSessionStateFromTranscript(
       cwd,
       originalTask,
       recentUserMessages,
+      userRequests,
+      sessionId: realSessionId,
+      chainRoot,
       gitCommits,
       keyCommands: dedupedCommands,
       lastAssistantMessage: lastAssistantMessage ? lastAssistantMessage.slice(0, 500) : null,
@@ -765,6 +823,7 @@ export function extractSessionStateFromTranscript(
 interface ParsedHandoff {
   isStructured: boolean
   task: string | null
+  openRequests: string[]
   completed: string[]
   inProgress: string[]
   failedApproaches: string[]
@@ -779,6 +838,7 @@ interface ParsedHandoff {
 
 const SECTION_HEADERS: Record<string, keyof ParsedHandoff> = {
   'TASK:': 'task',
+  'OPEN_REQUESTS:': 'openRequests',
   'COMPLETED:': 'completed',
   'IN_PROGRESS:': 'inProgress',
   'FAILED_APPROACHES:': 'failedApproaches',
@@ -799,6 +859,7 @@ export function parseStructuredHandoff(text: string): ParsedHandoff {
   const result: ParsedHandoff = {
     isStructured: false,
     task: null,
+    openRequests: [],
     completed: [],
     inProgress: [],
     failedApproaches: [],
@@ -876,6 +937,14 @@ export function parseStructuredHandoff(text: string): ParsedHandoff {
   }
 
   return result
+}
+
+/** The text after `continue`/`resume` in a transcript-form /clauditor command, if any. */
+function resumeCarriedText(commandMessage: string): string | null {
+  const args = commandMessage.match(/<command-args>([\s\S]*?)<\/command-args>/)
+  if (!args) return null
+  const rest = args[1].replace(/^\s*(continue|resume)\b/i, '').trim()
+  return rest && !rest.startsWith('<') ? rest : null
 }
 
 /**

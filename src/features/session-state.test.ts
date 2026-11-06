@@ -345,3 +345,120 @@ describe('recordOriginFromNewestHandoff', () => {
     expect(recordOriginFromNewestHandoff('sess-b', null)).toBe(false)
   })
 })
+
+describe('verbatim user requests and the chain', () => {
+  // vitest.setup.ts points HOME at a temp dir, so this is not the real ~/.clauditor
+  const handoffDir = (cwd: string) =>
+    join(homedir(), '.clauditor', 'sessions', cwd.replace(/[^a-zA-Z0-9]/g, '-').replace(/-+/g, '-'))
+
+  function transcript(dir: string, name: string, lines: string[]): string {
+    const p = join(dir, `${name}.jsonl`)
+    writeFileSync(p, lines.join('\n') + '\n')
+    return p
+  }
+
+  it('keeps every typed request verbatim, not just the last three, and names the chain', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'tr-'))
+    const lines: string[] = []
+    for (let i = 1; i <= 7; i++) {
+      lines.push(makeUserRecord(`${i}`, `ask number ${i}`))
+      lines.push(makeAssistantRecord(`${i}`, { text: `did ${i}` }))
+    }
+    const path = transcript(dir, 'sess-v', lines)
+    const state = extractSessionStateFromTranscript('sess-v', path)!
+    expect(state.userRequests).toHaveLength(7)
+    expect(state.userRequests[0]).toBe('ask number 1')
+    expect(state.userRequests[6]).toBe('ask number 7')
+    expect(state.recentUserMessages).toHaveLength(3)
+    expect(state.sessionId).toBe('sess-v')
+    expect(state.chainRoot).toBe('sess-v')
+
+    saveSessionState(state)
+    const md = readLastSessionState()!
+    expect(md).toContain('- **Chain:** sess-v')
+    expect(md).toContain('## User Requests (this session, verbatim)')
+    expect(md).toContain('1. ask number 1')
+    expect(md).toContain('7. ask number 7')
+    expect(md).not.toContain('## Recent User Messages')
+  })
+
+  it('a resumed session lists the text carried by /clauditor continue and writes to the chain root', async () => {
+    const { recordSessionOrigin } = await import('./session-origin.js')
+    const { appendRequest } = await import('./request-log.js')
+    const cwd = '/home/user/project'
+    recordSessionOrigin('sess-r', 'the original ask', '/h/0.md', undefined, 'sess-root')
+    appendRequest({ cwd, sessionId: 'sess-root', prompt: 'the original ask' })
+    appendRequest({ cwd, sessionId: 'sess-r', prompt: 'carried over ask' })
+
+    const dir = mkdtempSync(join(tmpdir(), 'tr-'))
+    const lines = [
+      makeUserRecord('0', '<command-message>clauditor</command-message>\n<command-name>/clauditor</command-name>\n<command-args>continue carried over ask</command-args>'),
+      makeAssistantRecord('0', { text: 'resuming' }),
+    ]
+    for (let i = 1; i <= 5; i++) {
+      lines.push(makeUserRecord(`${i}`, `follow-up ${i}`))
+      lines.push(makeAssistantRecord(`${i}`, { text: `ok ${i}` }))
+    }
+    const path = transcript(dir, 'sess-r', lines)
+    const state = extractSessionStateFromTranscript('sess-r', path)!
+    expect(state.originalTask).toBe('the original ask')
+    expect(state.chainRoot).toBe('sess-root')
+    expect(state.userRequests[0]).toBe('carried over ask')
+    expect(state.userRequests).toHaveLength(6)
+
+    saveSessionState(state)
+    const md = readLastSessionState()!
+    expect(md).toContain('- **Chain:** sess-root')
+    expect(md).toMatch(/Chain request log \(every prompt since the chain began, 2 so far\): .*requests-sess-root\.jsonl/)
+  })
+
+  it('recordOriginFromNewestHandoff carries the Chain line, and starts a new chain for an old handoff without one', async () => {
+    const { readSessionRoot } = await import('./session-origin.js')
+    const cwd = '/work/proj-chain'
+    mkdirSync(handoffDir(cwd), { recursive: true })
+    writeFileSync(join(handoffDir(cwd), `${Date.now()}.md`),
+      '# Last Session\n\n- **Branch:** main\n- **Chain:** root-77\n\n## Original Task\nship it\n')
+    expect(recordOriginFromNewestHandoff('sess-c1', cwd)).toBe(true)
+    expect(readSessionOrigin('sess-c1')).toBe('ship it')
+    expect(readSessionRoot('sess-c1')).toBe('root-77')
+
+    const cwd2 = '/work/proj-chain-2'
+    mkdirSync(handoffDir(cwd2), { recursive: true })
+    writeFileSync(join(handoffDir(cwd2), `${Date.now()}.md`), '# Last Session\n\n- **Chain:** root-88\n\n## Task\nx\n')
+    // no Original Task, but a chain: the chain still carries
+    expect(recordOriginFromNewestHandoff('sess-c2', cwd2)).toBe(true)
+    expect(readSessionOrigin('sess-c2')).toBeNull()
+    expect(readSessionRoot('sess-c2')).toBe('root-88')
+  })
+})
+
+describe('OPEN_REQUESTS in a structured handoff', () => {
+  it('is parsed and rendered first, after Task', async () => {
+    const { parseStructuredHandoff, savePostCompactSummary } = await import('./session-state.js')
+    const summary = [
+      'TASK: ship the dialog batch',
+      '',
+      'OPEN_REQUESTS:',
+      '- display the phone as a phone number — NOT STARTED',
+      '- vCard icon beside it — IN PROGRESS',
+      '',
+      'COMPLETED:',
+      '- dialog opens over the week (v1.2.3)',
+      '',
+      'IN_PROGRESS:',
+      '- nothing',
+    ].join('\n')
+    const parsed = parseStructuredHandoff(summary)
+    expect(parsed.isStructured).toBe(true)
+    expect(parsed.openRequests).toEqual([
+      'display the phone as a phone number — NOT STARTED',
+      'vCard icon beside it — IN PROGRESS',
+    ])
+
+    await savePostCompactSummary(summary, '/work/proj-open', null)
+    const md = readLastSessionState()!
+    expect(md.indexOf('## Open Requests')).toBeGreaterThan(md.indexOf('## Task'))
+    expect(md.indexOf('## Open Requests')).toBeLessThan(md.indexOf('## Completed'))
+    expect(md).toContain('- vCard icon beside it — IN PROGRESS')
+  })
+})

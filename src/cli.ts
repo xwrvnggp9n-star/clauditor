@@ -1660,14 +1660,23 @@ program
 const hookCmd = program
   .command('hook')
   .description('Internal hook handlers (called by Claude Code)')
-  .hook('preAction', async () => {
+  .hook('preAction', async (_thisCommand, actionCommand) => {
     // Claude desktop app sessions: every hook is a silent no-op unless opted in
     if (process.env.CLAUDE_CODE_ENTRYPOINT && process.env.CLAUDE_CODE_ENTRYPOINT !== 'claude-desktop') return
     const { readStdin } = await import('./hooks/shared.js')
     const { shouldSkipHook } = await import('./features/desktop-gate.js')
-    let hookInput: { session_id?: string; transcript_path?: string } = {}
+    let hookInput: { session_id?: string; transcript_path?: string; cwd?: string; prompt?: string } = {}
     try { hookInput = JSON.parse(await readStdin()) } catch {}
-    if (shouldSkipHook(process.env, hookInput)) process.exit(0)
+    if (shouldSkipHook(process.env, hookInput)) {
+      // One thing still runs in a gated desktop session: the verbatim request
+      // log. It is a silent local one-line write, and a request lost there is
+      // as lost as anywhere else once the session is turned on or resumed.
+      if (actionCommand.name() === 'user-prompt-submit' && hookInput.session_id) {
+        const { appendRequest } = await import('./features/request-log.js')
+        appendRequest({ cwd: hookInput.cwd, sessionId: hookInput.session_id, prompt: hookInput.prompt })
+      }
+      process.exit(0)
+    }
   })
 
 hookCmd
